@@ -1,4 +1,3 @@
--- MODIFIED BY SHRIMPER :D
 local Players               = game:GetService("Players")
 local PathfindingService    = game:GetService("PathfindingService")
 local UIS                   = game:GetService("UserInputService")
