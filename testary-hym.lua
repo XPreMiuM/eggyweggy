@@ -18,13 +18,16 @@ local PATH_PARAMS = {
     WaypointSpacing = shared.spacing or 3,
 }
 
-local REACH_DIST           = 4.5
-local WAYPOINT_TIMEOUT     = 4
-local JUMP_COOLDOWN        = 0.2
-local MAX_PATH_ATTEMPTS    = 5
-local WALK_HARD_TIMEOUT    = 90
-local QUEUE_COOLDOWN       = 0.2
-local RESCAN_INTERVAL      = 5
+local REACH_DIST             = 4.5
+local WAYPOINT_TIMEOUT       = 4
+local JUMP_COOLDOWN          = 0.2
+local MAX_PATH_ATTEMPTS      = 5
+local WALK_HARD_TIMEOUT      = 90
+local QUEUE_COOLDOWN         = 0.2
+local RESCAN_INTERVAL        = 5
+local STUCK_ESCAPE_THRESHOLD = 2    -- consecutive stuck_hard results before escape maneuver
+local DETOUR_MAX_DISTANCE    = 20   -- studs from waypoint to consider a detour egg
+local DETOUR_PATH_OVERHEAD   = 1.25 -- egg must not be >25% further from final target
 
 local EGG_COLORS = {
     [1] = Color3.fromRGB(255, 255, 255),
@@ -74,9 +77,7 @@ local DEFAULT_CONFIG = {
 local function deepMerge(dst, src)
     for k, v in pairs(src) do
         if type(v) == "table" then
-            if type(dst[k]) ~= "table" then
-                dst[k] = {}
-            end
+            if type(dst[k]) ~= "table" then dst[k] = {} end
             deepMerge(dst[k], v)
         elseif dst[k] == nil then
             dst[k] = v
@@ -114,10 +115,7 @@ end
 local config = loadConfig()
 
 local function saveConfig()
-    if not writefile then
-        return
-    end
-
+    if not writefile then return end
     pcall(function()
         writefile(CONFIG_FILE, HttpService:JSONEncode(config))
     end)
@@ -127,11 +125,11 @@ config.stats.scriptStarts += 1
 
 if config.runtime.lastJobId ~= "" and config.runtime.lastJobId ~= game.JobId then
     config.stats.autoExecCount += 1
-    config.stats.rejoinCount += 1
+    config.stats.rejoinCount   += 1
 end
 
-config.runtime.lastJobId = game.JobId
-config.runtime.lastPlaceId = game.PlaceId
+config.runtime.lastJobId     = game.JobId
+config.runtime.lastPlaceId   = game.PlaceId
 config.runtime.lastStartUnix = os.time()
 saveConfig()
 
@@ -145,30 +143,28 @@ local autoExecEnabled    = config.autoExecEnabled
 local autoRefreshEnabled = config.autoRefreshEnabled
 local refreshMinutes     = tonumber(config.refreshMinutes) or 20
 
--- anti afk
 local antiAfkEnabled = true
-local jumpInterval = tonumber(config.jumpInterval) or 30
+local jumpInterval   = tonumber(config.jumpInterval) or 30
 
--- recorder
-local recordedInputs = {}
-local isRecording = false
+local recordedInputs     = {}
+local isRecording        = false
 local isPlayingRecording = false
-local repeatRecording = false
-local repeatInterval = tonumber(config.repeatInterval) or 10
-local recordStartTime = 0
+local repeatRecording    = false
+local repeatInterval     = tonumber(config.repeatInterval) or 10
+local recordStartTime    = 0
 
-shared.toggled = farmEnabled
+shared.toggled         = farmEnabled
 shared.autoExecEnabled = autoExecEnabled
 
 local function syncConfig()
-    config.farmEnabled = farmEnabled
-    config.autoExecEnabled = autoExecEnabled
+    config.farmEnabled        = farmEnabled
+    config.autoExecEnabled    = autoExecEnabled
     config.autoRefreshEnabled = autoRefreshEnabled
-    config.refreshMinutes = refreshMinutes
-    config.jumpInterval = jumpInterval
-    config.repeatInterval = repeatInterval
-    shared.toggled = farmEnabled
-    shared.autoExecEnabled = autoExecEnabled
+    config.refreshMinutes     = refreshMinutes
+    config.jumpInterval       = jumpInterval
+    config.repeatInterval     = repeatInterval
+    shared.toggled            = farmEnabled
+    shared.autoExecEnabled    = autoExecEnabled
     saveConfig()
 end
 
@@ -218,22 +214,16 @@ local function classifyEgg(v)
         return nil
     end
 
-    local name = v.Name
-    local eggNum = tonumber(string.match(name, "egg_(%d+)$"))
+    local name    = v.Name
+    local eggNum  = tonumber(string.match(name, "egg_(%d+)$"))
     local isPotion = string.find(name, "potion", 1, true) ~= nil
 
     if eggNum then
-        return {
-            color = EGG_COLORS[eggNum] or DEFAULT_COLOR,
-            priority = eggNum
-        }
+        return { color = EGG_COLORS[eggNum] or DEFAULT_COLOR, priority = eggNum }
     end
 
     if isPotion then
-        return {
-            color = POTION_COLOR,
-            priority = 0
-        }
+        return { color = POTION_COLOR, priority = 0 }
     end
 
     return nil
@@ -241,12 +231,8 @@ end
 
 local function getDistanceToTarget(target)
     local root = getRoot(getChar())
-    local pos = resolvePos(target)
-
-    if not root or not pos then
-        return math.huge
-    end
-
+    local pos  = resolvePos(target)
+    if not root or not pos then return math.huge end
     return (root.Position - pos).Magnitude
 end
 
@@ -292,9 +278,7 @@ local function makePathFolder(waypoints, eggColor)
     local function cleanup()
         task.spawn(function()
             pcall(function()
-                if folder.Parent then
-                    folder:Destroy()
-                end
+                if folder.Parent then folder:Destroy() end
             end)
         end)
     end
@@ -303,7 +287,10 @@ local function makePathFolder(waypoints, eggColor)
 end
 
 local function doJump(hum)
-    if hum and hum:GetState() ~= Enum.HumanoidStateType.Jumping and hum:GetState() ~= Enum.HumanoidStateType.Freefall then
+    if hum
+        and hum:GetState() ~= Enum.HumanoidStateType.Jumping
+        and hum:GetState() ~= Enum.HumanoidStateType.Freefall
+    then
         hum:ChangeState(Enum.HumanoidStateType.Jumping)
     end
 end
@@ -312,16 +299,38 @@ local function buildRayParams(char)
     local rp = RaycastParams.new()
     rp.FilterType = Enum.RaycastFilterType.Blacklist
 
-    local ignore = {char}
+    local ignore     = {char}
     local activePath = workspace:FindFirstChild("ActivePath")
-    if activePath then
-        table.insert(ignore, activePath)
-    end
+    if activePath then table.insert(ignore, activePath) end
 
     rp.FilterDescendantsInstances = ignore
     return rp
 end
 
+-- ─── ESCAPE MANEUVER ─────────────────────────────────────────────────────────
+-- Triggered after STUCK_ESCAPE_THRESHOLD consecutive hard-stucks.
+-- Strafes randomly left or right for 3 seconds, then jumps to shake loose.
+local function doEscapeManeuver(hum, root)
+    if not hum or not root then return end
+
+    hum:MoveTo(root.Position)
+    task.wait(0.1)
+
+    local side      = (math.random(0, 1) == 0) and -1 or 1
+    local strafeDir = root.CFrame.RightVector * side
+
+    local escapeStart = tick()
+    while tick() - escapeStart < 3 do
+        if not farmEnabled then break end
+        hum:MoveTo(root.Position + strafeDir * 5)
+        task.wait(0.15)
+    end
+
+    doJump(hum)
+    task.wait(0.4)
+end
+
+-- ─── STEP TO WAYPOINT ────────────────────────────────────────────────────────
 local function stepToWaypoint(hum, root, wp)
     if not hum or not root then return "fail" end
 
@@ -358,7 +367,7 @@ local function stepToWaypoint(hum, root, wp)
 
         local dist = (root.Position - wp.Position).Magnitude
         if dist < REACH_DIST then
-            result = "reached"
+            result       = "reached"
             lastMoveTick = tick()
             break
         end
@@ -371,21 +380,20 @@ local function stepToWaypoint(hum, root, wp)
             if moved < MIN_PROGRESS then
                 stuckCount += 1
 
-                local dir = (wp.Position - root.Position)
+                local dir     = (wp.Position - root.Position)
                 local flatDir = Vector3.new(dir.X, 0, dir.Z)
-                if flatDir.Magnitude > 0 then
-                    flatDir = flatDir.Unit
-                end
+                if flatDir.Magnitude > 0 then flatDir = flatDir.Unit end
 
-                local rayParams = buildRayParams(char)
-                local frontRay = nil
+                local rayParams  = buildRayParams(char)
+                local frontRay   = nil
                 if flatDir.Magnitude > 0 then
                     frontRay = workspace:Raycast(root.Position, flatDir * 3, rayParams)
                 end
                 local ceilingRay = workspace:Raycast(root.Position, Vector3.new(0, 3.5, 0), rayParams)
 
+                -- After 3 micro-stucks on a single waypoint, escalate to caller
                 if stuckCount >= 3 then
-                    result = "timeout"
+                    result = "stuck_hard"
                     break
                 end
 
@@ -396,8 +404,8 @@ local function stepToWaypoint(hum, root, wp)
 
                 elseif frontRay then
                     if flatDir.Magnitude > 0 then
-                        local side = (math.random(0, 1) == 0) and -1 or 1
-                        local sidestep = root.CFrame.RightVector * side * 3
+                        local side           = (math.random(0, 1) == 0) and -1 or 1
+                        local sidestep       = root.CFrame.RightVector * side * 3
                         local sidestepTarget = root.Position + sidestep
                         hum:MoveTo(sidestepTarget)
                         task.wait(0.3)
@@ -426,27 +434,70 @@ local function stepToWaypoint(hum, root, wp)
     return result
 end
 
-local function walkToEgg(targetInstance, eggColor)
+-- ─── WALK TO EGG ─────────────────────────────────────────────────────────────
+-- Forward-declare so grabNearbyEgg (defined inside walkToEgg) can call back in.
+local walkToEgg
+
+local function grabNearbyEgg(currentWpPos, targetPos)
+    for _, data in ipairs(eggQueue) do
+        if not isAlive(data.target) then continue end
+        local eggPos = resolvePos(data.target)
+        if not eggPos then continue end
+
+        local distToEgg      = (currentWpPos - eggPos).Magnitude
+        local distEggToFinal = (eggPos - targetPos).Magnitude
+        local distWpToFinal  = (currentWpPos - targetPos).Magnitude
+
+        -- Grab if the egg is within DETOUR_MAX_DISTANCE of our current position
+        -- AND it doesn't take us more than DETOUR_PATH_OVERHEAD further from the goal
+        if distToEgg <= DETOUR_MAX_DISTANCE
+            and distEggToFinal <= distWpToFinal * DETOUR_PATH_OVERHEAD
+        then
+            local grabResult = walkToEgg(data.target, data.color)
+            if grabResult == "done" then
+                trackedEggs[data.id] = nil
+                queuedIds[data.id]   = nil
+                for i, e in ipairs(eggQueue) do
+                    if e.id == data.id then
+                        table.remove(eggQueue, i)
+                        break
+                    end
+                end
+            end
+            return -- only one detour per waypoint to avoid recursion spirals
+        end
+    end
+end
+
+walkToEgg = function(targetInstance, eggColor)
     local char = getChar()
-    local hum = getHum(char)
+    local hum  = getHum(char)
     local root = getRoot(char)
 
-    if not hum or not root then
-        return "fail"
-    end
+    if not hum or not root then return "fail" end
+
+    local consecutiveStucks = 0
 
     for attempt = 1, MAX_PATH_ATTEMPTS do
-        if not farmEnabled then
-            return "stopped"
-        end
+        if not farmEnabled then return "stopped" end
 
         local targetPos = resolvePos(targetInstance)
-        if not targetPos then
-            return "done"
+        if not targetPos then return "done" end
+
+        -- If hard-stuck enough times in a row, run the escape maneuver then repath
+        if consecutiveStucks >= STUCK_ESCAPE_THRESHOLD then
+            print("[EggBot] Hard stuck x" .. consecutiveStucks .. " — running escape maneuver")
+            doEscapeManeuver(hum, root)
+            consecutiveStucks = 0
+            -- Refresh refs after maneuver in case character respawned
+            char = getChar()
+            hum  = getHum(char)
+            root = getRoot(char)
+            if not hum or not root then return "fail" end
         end
 
         local path = PathfindingService:CreatePath(PATH_PARAMS)
-        local ok = pcall(function()
+        local ok   = pcall(function()
             path:ComputeAsync(root.Position, targetPos)
         end)
 
@@ -455,9 +506,9 @@ local function walkToEgg(targetInstance, eggColor)
             continue
         end
 
-        local waypoints = path:GetWaypoints()
+        local waypoints           = path:GetWaypoints()
         local pathFolder, cleanup = makePathFolder(waypoints, eggColor)
-        local pathBroken = false
+        local pathBroken          = false
 
         for i, wp in ipairs(waypoints) do
             if not farmEnabled or not isAlive(targetInstance) then
@@ -472,23 +523,33 @@ local function walkToEgg(targetInstance, eggColor)
                 end
             end
 
-            if needsJump then
-                doJump(hum)
-            end
+            if needsJump then doJump(hum) end
 
             local stepResult = stepToWaypoint(hum, root, wp)
 
-            if stepResult == "timeout" or stepResult == "fail" or stepResult == "stopped" then
+            if stepResult == "stuck_hard" then
+                -- Increment and break out so the escape check fires at loop top
+                consecutiveStucks += 1
                 pathBroken = true
                 break
+
+            elseif stepResult == "timeout" or stepResult == "fail" or stepResult == "stopped" then
+                pathBroken = true
+                break
+
+            else
+                -- Clean step — reset stuck counter and check for opportunistic detours
+                consecutiveStucks = 0
+                -- Skip the last two waypoints to avoid overshooting the primary target
+                if i < #waypoints - 1 then
+                    grabNearbyEgg(wp.Position, targetPos)
+                end
             end
         end
 
         cleanup()
 
-        if not farmEnabled then
-            return "stopped"
-        end
+        if not farmEnabled then return "stopped" end
 
         if pathBroken then
             task.wait(0.2)
@@ -511,11 +572,12 @@ local function walkToEgg(targetInstance, eggColor)
     return "fail"
 end
 
+-- ─── QUEUE / SCAN ────────────────────────────────────────────────────────────
 local function pruneTrackedEggs()
     for uid, data in pairs(trackedEggs) do
         if not isAlive(data.target) then
             trackedEggs[uid] = nil
-            queuedIds[uid] = nil
+            queuedIds[uid]   = nil
         end
     end
 end
@@ -526,7 +588,7 @@ local function pruneQueue()
         if isAlive(e.target) then
             table.insert(alive, e)
         else
-            queuedIds[e.id] = nil
+            queuedIds[e.id]   = nil
             trackedEggs[e.id] = nil
         end
     end
@@ -543,11 +605,11 @@ local function queueEgg(v)
     if trackedEggs[uid] then return end
 
     local data = {
-        target = v,
-        color = info.color,
-        id = uid,
+        target    = v,
+        color     = info.color,
+        id        = uid,
         firstSeen = tick(),
-        priority = info.priority,
+        priority  = info.priority,
     }
 
     trackedEggs[uid] = data
@@ -600,7 +662,7 @@ local function processQueue()
                     if isAlive(data.target) then
                         if not queuedIds[data.id] then
                             queuedIds[data.id] = true
-                            data.firstSeen = data.firstSeen or tick()
+                            data.firstSeen     = data.firstSeen or tick()
                             table.insert(eggQueue, data)
                             sortQueue()
                         end
@@ -627,12 +689,11 @@ local function onPossibleEgg(v)
     task.spawn(function()
         task.wait(0.05)
         queueEgg(v)
-        if farmEnabled then
-            processQueue()
-        end
+        if farmEnabled then processQueue() end
     end)
 end
 
+-- ─── WEBHOOK ─────────────────────────────────────────────────────────────────
 local function getRequestFunc()
     return request
         or http_request
@@ -642,26 +703,18 @@ end
 
 local function sendWebhookMessage(message)
     local webhookUrl = tostring(config.webhookUrl or "")
-    if webhookUrl == "" then
-        return
-    end
+    if webhookUrl == "" then return end
 
     local req = getRequestFunc()
-    if not req then
-        return
-    end
+    if not req then return end
 
     task.spawn(function()
         pcall(function()
             req({
-                Url = webhookUrl,
-                Method = "POST",
-                Headers = {
-                    ["Content-Type"] = "application/json"
-                },
-                Body = HttpService:JSONEncode({
-                    content = message
-                })
+                Url     = webhookUrl,
+                Method  = "POST",
+                Headers = { ["Content-Type"] = "application/json" },
+                Body    = HttpService:JSONEncode({ content = message })
             })
         end)
     end)
@@ -685,10 +738,9 @@ local function buildStatusText(reason)
     )
 end
 
+-- ─── AUTO EXEC ───────────────────────────────────────────────────────────────
 local function setupAutoExec()
-    if not autoExecEnabled then
-        return
-    end
+    if not autoExecEnabled then return end
 
     if RAW_SCRIPT_URL == "" or RAW_SCRIPT_URL == "PASTE_YOUR_RAW_GITHUB_LINK_HERE" then
         warn("[EggBot] RAW_SCRIPT_URL not set")
@@ -706,18 +758,16 @@ local function setupAutoExec()
     end
 end
 
+-- ─── SOFT REFRESH ────────────────────────────────────────────────────────────
 local function softRefreshMacro()
-    isWalking = false
-
-    eggQueue = {}
-    queuedIds = {}
+    isWalking   = false
+    eggQueue    = {}
+    queuedIds   = {}
     trackedEggs = {}
 
     local activePath = workspace:FindFirstChild("ActivePath")
     if activePath then
-        pcall(function()
-            activePath:Destroy()
-        end)
+        pcall(function() activePath:Destroy() end)
     end
 
     scanAllEggs()
@@ -728,18 +778,18 @@ local function softRefreshMacro()
     end
 end
 
--- recorder
+-- ─── RECORDER ────────────────────────────────────────────────────────────────
 local allowedKeys = {
-    [Enum.KeyCode.W] = true,
-    [Enum.KeyCode.A] = true,
-    [Enum.KeyCode.S] = true,
-    [Enum.KeyCode.D] = true,
+    [Enum.KeyCode.W]     = true,
+    [Enum.KeyCode.A]     = true,
+    [Enum.KeyCode.S]     = true,
+    [Enum.KeyCode.D]     = true,
     [Enum.KeyCode.Space] = true,
 }
 
 local function startRecording()
-    recordedInputs = {}
-    isRecording = true
+    recordedInputs  = {}
+    isRecording     = true
     recordStartTime = tick()
 end
 
@@ -753,10 +803,7 @@ local function playRecording()
         return
     end
 
-    if isPlayingRecording then
-        return
-    end
-
+    if isPlayingRecording then return end
     isPlayingRecording = true
 
     task.spawn(function()
@@ -764,12 +811,10 @@ local function playRecording()
 
         for _, ev in ipairs(recordedInputs) do
             local targetTime = ev.t / 1000
-            local now = tick() - playStart
-            local waitTime = targetTime - now
+            local now        = tick() - playStart
+            local waitTime   = targetTime - now
 
-            if waitTime > 0 then
-                task.wait(waitTime)
-            end
+            if waitTime > 0 then task.wait(waitTime) end
 
             local isDown = (ev.state == "begin")
             VIM:SendKeyEvent(isDown, ev.key, false, game)
@@ -786,8 +831,8 @@ UIS.InputBegan:Connect(function(input, gameProcessed)
     if not allowedKeys[input.KeyCode] then return end
 
     table.insert(recordedInputs, {
-        t = math.floor((tick() - recordStartTime) * 1000),
-        key = input.KeyCode,
+        t     = math.floor((tick() - recordStartTime) * 1000),
+        key   = input.KeyCode,
         state = "begin"
     })
 end)
@@ -798,239 +843,239 @@ UIS.InputEnded:Connect(function(input, gameProcessed)
     if not allowedKeys[input.KeyCode] then return end
 
     table.insert(recordedInputs, {
-        t = math.floor((tick() - recordStartTime) * 1000),
-        key = input.KeyCode,
+        t     = math.floor((tick() - recordStartTime) * 1000),
+        key   = input.KeyCode,
         state = "end"
     })
 end)
 
--- UI
-local screenGui = Instance.new("ScreenGui")
-screenGui.Name = "EggBotUI"
+-- ─── UI ──────────────────────────────────────────────────────────────────────
+local screenGui        = Instance.new("ScreenGui")
+screenGui.Name         = "EggBotUI"
 screenGui.ResetOnSpawn = false
-screenGui.Parent = playerGui
+screenGui.Parent       = playerGui
 
-local frame = Instance.new("Frame")
-frame.Size = UDim2.new(0, 320, 0, 610)
-frame.Position = UDim2.new(0, 20, 0, 120)
+local frame            = Instance.new("Frame")
+frame.Size             = UDim2.new(0, 320, 0, 610)
+frame.Position         = UDim2.new(0, 20, 0, 120)
 frame.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
-frame.BorderSizePixel = 0
-frame.Parent = screenGui
+frame.BorderSizePixel  = 0
+frame.Parent           = screenGui
 
-local corner = Instance.new("UICorner")
-corner.CornerRadius = UDim.new(0, 10)
-corner.Parent = frame
+local corner           = Instance.new("UICorner")
+corner.CornerRadius    = UDim.new(0, 10)
+corner.Parent          = frame
 
-local title = Instance.new("TextLabel")
-title.Size = UDim2.new(1, 0, 0, 30)
-title.Position = UDim2.new(0, 0, 0, 0)
+local title            = Instance.new("TextLabel")
+title.Size             = UDim2.new(1, 0, 0, 30)
+title.Position         = UDim2.new(0, 0, 0, 0)
 title.BackgroundTransparency = 1
-title.Text = "Egg Macro"
-title.TextColor3 = Color3.fromRGB(255, 255, 255)
-title.TextScaled = true
-title.Font = Enum.Font.SourceSansBold
-title.Parent = frame
+title.Text             = "Egg Macro"
+title.TextColor3       = Color3.fromRGB(255, 255, 255)
+title.TextScaled       = true
+title.Font             = Enum.Font.SourceSansBold
+title.Parent           = frame
 
-local toggleButton = Instance.new("TextButton")
-toggleButton.Size = UDim2.new(0, 280, 0, 35)
-toggleButton.Position = UDim2.new(0, 20, 0, 40)
+local toggleButton     = Instance.new("TextButton")
+toggleButton.Size      = UDim2.new(0, 280, 0, 35)
+toggleButton.Position  = UDim2.new(0, 20, 0, 40)
 toggleButton.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
 toggleButton.TextColor3 = Color3.fromRGB(255, 255, 255)
-toggleButton.Font = Enum.Font.SourceSansBold
+toggleButton.Font      = Enum.Font.SourceSansBold
 toggleButton.TextScaled = true
-toggleButton.Text = farmEnabled and "Macro: ON" or "Macro: OFF"
-toggleButton.Parent = frame
+toggleButton.Text      = farmEnabled and "Macro: ON" or "Macro: OFF"
+toggleButton.Parent    = frame
 
-local toggleCorner = Instance.new("UICorner")
+local toggleCorner     = Instance.new("UICorner")
 toggleCorner.CornerRadius = UDim.new(0, 8)
-toggleCorner.Parent = toggleButton
+toggleCorner.Parent    = toggleButton
 
-local jumpLabel = Instance.new("TextLabel")
-jumpLabel.Size = UDim2.new(0, 280, 0, 20)
-jumpLabel.Position = UDim2.new(0, 20, 0, 85)
+local jumpLabel        = Instance.new("TextLabel")
+jumpLabel.Size         = UDim2.new(0, 280, 0, 20)
+jumpLabel.Position     = UDim2.new(0, 20, 0, 85)
 jumpLabel.BackgroundTransparency = 1
-jumpLabel.Text = "Jump every X seconds:"
-jumpLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
-jumpLabel.Font = Enum.Font.SourceSans
-jumpLabel.TextScaled = true
-jumpLabel.Parent = frame
+jumpLabel.Text         = "Jump every X seconds:"
+jumpLabel.TextColor3   = Color3.fromRGB(255, 255, 255)
+jumpLabel.Font         = Enum.Font.SourceSans
+jumpLabel.TextScaled   = true
+jumpLabel.Parent       = frame
 
-local jumpBox = Instance.new("TextBox")
-jumpBox.Size = UDim2.new(0, 280, 0, 28)
-jumpBox.Position = UDim2.new(0, 20, 0, 108)
+local jumpBox          = Instance.new("TextBox")
+jumpBox.Size           = UDim2.new(0, 280, 0, 28)
+jumpBox.Position       = UDim2.new(0, 20, 0, 108)
 jumpBox.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
-jumpBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+jumpBox.TextColor3     = Color3.fromRGB(255, 255, 255)
 jumpBox.PlaceholderText = "Enter seconds"
-jumpBox.Text = tostring(jumpInterval)
-jumpBox.Font = Enum.Font.SourceSans
-jumpBox.TextScaled = true
+jumpBox.Text           = tostring(jumpInterval)
+jumpBox.Font           = Enum.Font.SourceSans
+jumpBox.TextScaled     = true
 jumpBox.ClearTextOnFocus = false
-jumpBox.Parent = frame
+jumpBox.Parent         = frame
 
-local jumpCorner = Instance.new("UICorner")
+local jumpCorner       = Instance.new("UICorner")
 jumpCorner.CornerRadius = UDim.new(0, 8)
-jumpCorner.Parent = jumpBox
+jumpCorner.Parent      = jumpBox
 
-local recordButton = Instance.new("TextButton")
-recordButton.Size = UDim2.new(0, 135, 0, 35)
-recordButton.Position = UDim2.new(0, 20, 0, 148)
+local recordButton     = Instance.new("TextButton")
+recordButton.Size      = UDim2.new(0, 135, 0, 35)
+recordButton.Position  = UDim2.new(0, 20, 0, 148)
 recordButton.BackgroundColor3 = Color3.fromRGB(70, 70, 70)
 recordButton.TextColor3 = Color3.fromRGB(255, 255, 255)
-recordButton.Font = Enum.Font.SourceSansBold
+recordButton.Font      = Enum.Font.SourceSansBold
 recordButton.TextScaled = true
-recordButton.Text = "Record: OFF"
-recordButton.Parent = frame
+recordButton.Text      = "Record: OFF"
+recordButton.Parent    = frame
 
-local recordCorner = Instance.new("UICorner")
+local recordCorner     = Instance.new("UICorner")
 recordCorner.CornerRadius = UDim.new(0, 8)
-recordCorner.Parent = recordButton
+recordCorner.Parent    = recordButton
 
-local testButton = Instance.new("TextButton")
-testButton.Size = UDim2.new(0, 135, 0, 35)
-testButton.Position = UDim2.new(0, 165, 0, 148)
+local testButton       = Instance.new("TextButton")
+testButton.Size        = UDim2.new(0, 135, 0, 35)
+testButton.Position    = UDim2.new(0, 165, 0, 148)
 testButton.BackgroundColor3 = Color3.fromRGB(70, 70, 70)
-testButton.TextColor3 = Color3.fromRGB(255, 255, 255)
-testButton.Font = Enum.Font.SourceSansBold
-testButton.TextScaled = true
-testButton.Text = "Test Recording"
-testButton.Parent = frame
+testButton.TextColor3  = Color3.fromRGB(255, 255, 255)
+testButton.Font        = Enum.Font.SourceSansBold
+testButton.TextScaled  = true
+testButton.Text        = "Test Recording"
+testButton.Parent      = frame
 
-local testCorner = Instance.new("UICorner")
+local testCorner       = Instance.new("UICorner")
 testCorner.CornerRadius = UDim.new(0, 8)
-testCorner.Parent = testButton
+testCorner.Parent      = testButton
 
-local repeatLabel = Instance.new("TextLabel")
-repeatLabel.Size = UDim2.new(0, 280, 0, 20)
-repeatLabel.Position = UDim2.new(0, 20, 0, 194)
+local repeatLabel      = Instance.new("TextLabel")
+repeatLabel.Size       = UDim2.new(0, 280, 0, 20)
+repeatLabel.Position   = UDim2.new(0, 20, 0, 194)
 repeatLabel.BackgroundTransparency = 1
-repeatLabel.Text = "Run recording every X seconds:"
+repeatLabel.Text       = "Run recording every X seconds:"
 repeatLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
-repeatLabel.Font = Enum.Font.SourceSans
+repeatLabel.Font       = Enum.Font.SourceSans
 repeatLabel.TextScaled = true
-repeatLabel.Parent = frame
+repeatLabel.Parent     = frame
 
-local repeatBox = Instance.new("TextBox")
-repeatBox.Size = UDim2.new(0, 280, 0, 28)
-repeatBox.Position = UDim2.new(0, 20, 0, 217)
+local repeatBox        = Instance.new("TextBox")
+repeatBox.Size         = UDim2.new(0, 280, 0, 28)
+repeatBox.Position     = UDim2.new(0, 20, 0, 217)
 repeatBox.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
-repeatBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+repeatBox.TextColor3   = Color3.fromRGB(255, 255, 255)
 repeatBox.PlaceholderText = "Enter seconds"
-repeatBox.Text = tostring(repeatInterval)
-repeatBox.Font = Enum.Font.SourceSans
-repeatBox.TextScaled = true
+repeatBox.Text         = tostring(repeatInterval)
+repeatBox.Font         = Enum.Font.SourceSans
+repeatBox.TextScaled   = true
 repeatBox.ClearTextOnFocus = false
-repeatBox.Parent = frame
+repeatBox.Parent       = frame
 
-local repeatCorner = Instance.new("UICorner")
+local repeatCorner     = Instance.new("UICorner")
 repeatCorner.CornerRadius = UDim.new(0, 8)
-repeatCorner.Parent = repeatBox
+repeatCorner.Parent    = repeatBox
 
-local repeatToggle = Instance.new("TextButton")
-repeatToggle.Size = UDim2.new(0, 280, 0, 35)
-repeatToggle.Position = UDim2.new(0, 20, 0, 258)
+local repeatToggle     = Instance.new("TextButton")
+repeatToggle.Size      = UDim2.new(0, 280, 0, 35)
+repeatToggle.Position  = UDim2.new(0, 20, 0, 258)
 repeatToggle.BackgroundColor3 = Color3.fromRGB(70, 70, 70)
 repeatToggle.TextColor3 = Color3.fromRGB(255, 255, 255)
-repeatToggle.Font = Enum.Font.SourceSansBold
+repeatToggle.Font      = Enum.Font.SourceSansBold
 repeatToggle.TextScaled = true
-repeatToggle.Text = "Recorder Loop: OFF"
-repeatToggle.Parent = frame
+repeatToggle.Text      = "Recorder Loop: OFF"
+repeatToggle.Parent    = frame
 
 local repeatToggleCorner = Instance.new("UICorner")
 repeatToggleCorner.CornerRadius = UDim.new(0, 8)
 repeatToggleCorner.Parent = repeatToggle
 
-local autoExecButton = Instance.new("TextButton")
-autoExecButton.Size = UDim2.new(0, 280, 0, 35)
+local autoExecButton   = Instance.new("TextButton")
+autoExecButton.Size    = UDim2.new(0, 280, 0, 35)
 autoExecButton.Position = UDim2.new(0, 20, 0, 304)
 autoExecButton.BackgroundColor3 = Color3.fromRGB(70, 70, 70)
 autoExecButton.TextColor3 = Color3.fromRGB(255, 255, 255)
-autoExecButton.Font = Enum.Font.SourceSansBold
+autoExecButton.Font    = Enum.Font.SourceSansBold
 autoExecButton.TextScaled = true
-autoExecButton.Text = autoExecEnabled and "Auto Exec: ON" or "Auto Exec: OFF"
-autoExecButton.Parent = frame
+autoExecButton.Text    = autoExecEnabled and "Auto Exec: ON" or "Auto Exec: OFF"
+autoExecButton.Parent  = frame
 
-local autoExecCorner = Instance.new("UICorner")
+local autoExecCorner   = Instance.new("UICorner")
 autoExecCorner.CornerRadius = UDim.new(0, 8)
-autoExecCorner.Parent = autoExecButton
+autoExecCorner.Parent  = autoExecButton
 
 local autoRefreshButton = Instance.new("TextButton")
-autoRefreshButton.Size = UDim2.new(0, 280, 0, 35)
+autoRefreshButton.Size  = UDim2.new(0, 280, 0, 35)
 autoRefreshButton.Position = UDim2.new(0, 20, 0, 350)
 autoRefreshButton.BackgroundColor3 = Color3.fromRGB(70, 70, 70)
 autoRefreshButton.TextColor3 = Color3.fromRGB(255, 255, 255)
-autoRefreshButton.Font = Enum.Font.SourceSansBold
+autoRefreshButton.Font  = Enum.Font.SourceSansBold
 autoRefreshButton.TextScaled = true
-autoRefreshButton.Text = autoRefreshEnabled and "Soft Refresh: ON" or "Soft Refresh: OFF"
+autoRefreshButton.Text  = autoRefreshEnabled and "Soft Refresh: ON" or "Soft Refresh: OFF"
 autoRefreshButton.Parent = frame
 
 local autoRefreshCorner = Instance.new("UICorner")
 autoRefreshCorner.CornerRadius = UDim.new(0, 8)
 autoRefreshCorner.Parent = autoRefreshButton
 
-local refreshLabel = Instance.new("TextLabel")
-refreshLabel.Size = UDim2.new(0, 280, 0, 20)
-refreshLabel.Position = UDim2.new(0, 20, 0, 395)
+local refreshLabel     = Instance.new("TextLabel")
+refreshLabel.Size      = UDim2.new(0, 280, 0, 20)
+refreshLabel.Position  = UDim2.new(0, 20, 0, 395)
 refreshLabel.BackgroundTransparency = 1
-refreshLabel.Text = "Soft refresh every X minutes:"
+refreshLabel.Text      = "Soft refresh every X minutes:"
 refreshLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
-refreshLabel.Font = Enum.Font.SourceSans
+refreshLabel.Font      = Enum.Font.SourceSans
 refreshLabel.TextScaled = true
-refreshLabel.Parent = frame
+refreshLabel.Parent    = frame
 
-local refreshBox = Instance.new("TextBox")
-refreshBox.Size = UDim2.new(0, 280, 0, 28)
-refreshBox.Position = UDim2.new(0, 20, 0, 418)
+local refreshBox       = Instance.new("TextBox")
+refreshBox.Size        = UDim2.new(0, 280, 0, 28)
+refreshBox.Position    = UDim2.new(0, 20, 0, 418)
 refreshBox.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
-refreshBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+refreshBox.TextColor3  = Color3.fromRGB(255, 255, 255)
 refreshBox.PlaceholderText = "Enter minutes"
-refreshBox.Text = tostring(refreshMinutes)
-refreshBox.Font = Enum.Font.SourceSans
-refreshBox.TextScaled = true
+refreshBox.Text        = tostring(refreshMinutes)
+refreshBox.Font        = Enum.Font.SourceSans
+refreshBox.TextScaled  = true
 refreshBox.ClearTextOnFocus = false
-refreshBox.Parent = frame
+refreshBox.Parent      = frame
 
-local refreshCorner = Instance.new("UICorner")
+local refreshCorner    = Instance.new("UICorner")
 refreshCorner.CornerRadius = UDim.new(0, 8)
-refreshCorner.Parent = refreshBox
+refreshCorner.Parent   = refreshBox
 
-local webhookLabel = Instance.new("TextLabel")
-webhookLabel.Size = UDim2.new(0, 280, 0, 20)
-webhookLabel.Position = UDim2.new(0, 20, 0, 455)
+local webhookLabel     = Instance.new("TextLabel")
+webhookLabel.Size      = UDim2.new(0, 280, 0, 20)
+webhookLabel.Position  = UDim2.new(0, 20, 0, 455)
 webhookLabel.BackgroundTransparency = 1
-webhookLabel.Text = "Discord webhook (text only):"
+webhookLabel.Text      = "Discord webhook (text only):"
 webhookLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
-webhookLabel.Font = Enum.Font.SourceSans
+webhookLabel.Font      = Enum.Font.SourceSans
 webhookLabel.TextScaled = true
-webhookLabel.Parent = frame
+webhookLabel.Parent    = frame
 
-local webhookBox = Instance.new("TextBox")
-webhookBox.Size = UDim2.new(0, 280, 0, 28)
-webhookBox.Position = UDim2.new(0, 20, 0, 478)
+local webhookBox       = Instance.new("TextBox")
+webhookBox.Size        = UDim2.new(0, 280, 0, 28)
+webhookBox.Position    = UDim2.new(0, 20, 0, 478)
 webhookBox.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
-webhookBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+webhookBox.TextColor3  = Color3.fromRGB(255, 255, 255)
 webhookBox.PlaceholderText = "Paste webhook URL"
-webhookBox.Text = tostring(config.webhookUrl or "")
-webhookBox.Font = Enum.Font.SourceSans
-webhookBox.TextScaled = false
+webhookBox.Text        = tostring(config.webhookUrl or "")
+webhookBox.Font        = Enum.Font.SourceSans
+webhookBox.TextScaled  = false
 webhookBox.ClearTextOnFocus = false
 webhookBox.TextXAlignment = Enum.TextXAlignment.Left
-webhookBox.Parent = frame
+webhookBox.Parent      = frame
 
-local webhookCorner = Instance.new("UICorner")
+local webhookCorner    = Instance.new("UICorner")
 webhookCorner.CornerRadius = UDim.new(0, 8)
-webhookCorner.Parent = webhookBox
+webhookCorner.Parent   = webhookBox
 
-local statsLabel = Instance.new("TextLabel")
-statsLabel.Size = UDim2.new(0, 280, 0, 80)
-statsLabel.Position = UDim2.new(0, 20, 0, 520)
+local statsLabel       = Instance.new("TextLabel")
+statsLabel.Size        = UDim2.new(0, 280, 0, 80)
+statsLabel.Position    = UDim2.new(0, 20, 0, 520)
 statsLabel.BackgroundTransparency = 1
-statsLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
-statsLabel.Font = Enum.Font.SourceSans
-statsLabel.TextScaled = false
+statsLabel.TextColor3  = Color3.fromRGB(255, 255, 255)
+statsLabel.Font        = Enum.Font.SourceSans
+statsLabel.TextScaled  = false
 statsLabel.TextWrapped = true
 statsLabel.TextXAlignment = Enum.TextXAlignment.Left
 statsLabel.TextYAlignment = Enum.TextYAlignment.Top
-statsLabel.Parent = frame
+statsLabel.Parent      = frame
 
 local function updateStatsLabel()
     statsLabel.Text =
@@ -1044,6 +1089,7 @@ end
 
 updateStatsLabel()
 
+-- ─── BUTTON CALLBACKS ────────────────────────────────────────────────────────
 toggleButton.MouseButton1Click:Connect(function()
     farmEnabled = not farmEnabled
     syncConfig()
@@ -1061,27 +1107,21 @@ end)
 
 jumpBox.FocusLost:Connect(function()
     local num = tonumber(jumpBox.Text)
-    if num and num > 0 then
-        jumpInterval = num
-    end
+    if num and num > 0 then jumpInterval = num end
     jumpBox.Text = tostring(jumpInterval)
     syncConfig()
 end)
 
 repeatBox.FocusLost:Connect(function()
     local num = tonumber(repeatBox.Text)
-    if num and num > 0 then
-        repeatInterval = num
-    end
+    if num and num > 0 then repeatInterval = num end
     repeatBox.Text = tostring(repeatInterval)
     syncConfig()
 end)
 
 refreshBox.FocusLost:Connect(function()
     local num = tonumber(refreshBox.Text)
-    if num and num > 0 then
-        refreshMinutes = math.max(1, math.floor(num))
-    end
+    if num and num > 0 then refreshMinutes = math.max(1, math.floor(num)) end
     refreshBox.Text = tostring(refreshMinutes)
     syncConfig()
     updateStatsLabel()
@@ -1115,10 +1155,7 @@ autoExecButton.MouseButton1Click:Connect(function()
     autoExecEnabled = not autoExecEnabled
     syncConfig()
     autoExecButton.Text = autoExecEnabled and "Auto Exec: ON" or "Auto Exec: OFF"
-
-    if autoExecEnabled then
-        setupAutoExec()
-    end
+    if autoExecEnabled then setupAutoExec() end
     updateStatsLabel()
 end)
 
@@ -1129,15 +1166,16 @@ autoRefreshButton.MouseButton1Click:Connect(function()
     updateStatsLabel()
 end)
 
+-- ─── DRAG ────────────────────────────────────────────────────────────────────
 local dragging = false
 local dragStart
 local startPos
 
 title.InputBegan:Connect(function(input)
     if input.UserInputType == Enum.UserInputType.MouseButton1 then
-        dragging = true
+        dragging  = true
         dragStart = input.Position
-        startPos = frame.Position
+        startPos  = frame.Position
 
         input.Changed:Connect(function()
             if input.UserInputState == Enum.UserInputState.End then
@@ -1159,14 +1197,13 @@ UIS.InputChanged:Connect(function(input)
     end
 end)
 
+-- ─── BACKGROUND LOOPS ────────────────────────────────────────────────────────
 task.spawn(function()
     while true do
         task.wait(jumpInterval)
         if farmEnabled and antiAfkEnabled then
             local hum = getHum(getChar())
-            if hum then
-                doJump(hum)
-            end
+            if hum then doJump(hum) end
         end
     end
 end)
@@ -1174,14 +1211,9 @@ end)
 task.spawn(function()
     while true do
         task.wait(0.2)
-
         if repeatRecording and #recordedInputs > 0 and not isPlayingRecording then
             playRecording()
-
-            while isPlayingRecording do
-                task.wait(0.1)
-            end
-
+            while isPlayingRecording do task.wait(0.1) end
             task.wait(repeatInterval)
         end
     end
@@ -1191,26 +1223,22 @@ task.spawn(function()
     while true do
         task.wait(RESCAN_INTERVAL)
         scanAllEggs()
-        if farmEnabled then
-            processQueue()
-        end
+        if farmEnabled then processQueue() end
     end
 end)
 
 task.spawn(function()
     while true do
         task.wait(1)
-
         if autoRefreshEnabled then
             local refreshSeconds = math.max(60, refreshMinutes * 60)
-            local elapsed = os.time() - (config.runtime.lastStartUnix or os.time())
+            local elapsed        = os.time() - (config.runtime.lastStartUnix or os.time())
 
             if elapsed >= refreshSeconds then
-                config.stats.softRefreshCount += 1
-                config.runtime.lastStartUnix = os.time()
+                config.stats.softRefreshCount  += 1
+                config.runtime.lastStartUnix    = os.time()
                 saveConfig()
                 updateStatsLabel()
-
                 softRefreshMacro()
                 sendWebhookMessage(buildStatusText("Scheduled soft refresh"))
             end
@@ -1223,9 +1251,7 @@ workspace.DescendantAdded:Connect(onPossibleEgg)
 task.spawn(function()
     task.wait(1)
     scanAllEggs()
-    if farmEnabled then
-        processQueue()
-    end
+    if farmEnabled then processQueue() end
 end)
 
 player.Chatted:Connect(function(msg)
@@ -1257,5 +1283,4 @@ if farmEnabled then
 end
 
 sendWebhookMessage(buildStatusText("Script loaded"))
-
 print("[EggBot] Bot Loaded - Saved State + Auto Exec + Soft Refresh + Webhook Text Status!")
