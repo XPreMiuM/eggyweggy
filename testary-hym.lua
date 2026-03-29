@@ -1,10 +1,15 @@
+-- MODIFIED BY SHRIMPER :D
 local Players               = game:GetService("Players")
 local PathfindingService    = game:GetService("PathfindingService")
 local UIS                   = game:GetService("UserInputService")
 local VIM                   = game:GetService("VirtualInputManager")
+local HttpService           = game:GetService("HttpService")
 
 local player    = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
+
+local RAW_SCRIPT_URL = "https://raw.githubusercontent.com/XPreMiuM/eggyweggy/refs/heads/main/testary-hym.lua"
+local CONFIG_FILE    = "eggbot_config.json"
 
 local PATH_PARAMS = {
     AgentHeight     = 2,
@@ -34,25 +39,139 @@ local JUMP_COLOR     = Color3.fromRGB(255, 100, 0)
 local POTION_COLOR   = Color3.fromRGB(170, 0,   255)
 local DEFAULT_COLOR  = Color3.new(1, 1, 1)
 
-local farmEnabled     = shared.toggled or false
-local isWalking       = false
-local eggQueue        = {}
-local queuedIds       = {}
-local trackedEggs     = {}
-local lastMoveTick    = tick()
-local autoExecEnabled = shared.autoExecEnabled or false
+local function cloneTable(t)
+    local out = {}
+    for k, v in pairs(t) do
+        if type(v) == "table" then
+            out[k] = cloneTable(v)
+        else
+            out[k] = v
+        end
+    end
+    return out
+end
+
+local DEFAULT_CONFIG = {
+    farmEnabled = false,
+    autoExecEnabled = false,
+    autoRefreshEnabled = false,
+    refreshMinutes = 20,
+    jumpInterval = 30,
+    repeatInterval = 10,
+    webhookUrl = "",
+    stats = {
+        scriptStarts = 0,
+        autoExecCount = 0,
+        rejoinCount = 0,
+        softRefreshCount = 0,
+    },
+    runtime = {
+        lastJobId = "",
+        lastPlaceId = 0,
+        lastStartUnix = 0,
+    }
+}
+
+local function deepMerge(dst, src)
+    for k, v in pairs(src) do
+        if type(v) == "table" then
+            if type(dst[k]) ~= "table" then
+                dst[k] = {}
+            end
+            deepMerge(dst[k], v)
+        elseif dst[k] == nil then
+            dst[k] = v
+        end
+    end
+end
+
+local function loadConfig()
+    local cfg = cloneTable(DEFAULT_CONFIG)
+
+    local okFile, exists = pcall(function()
+        return isfile and isfile(CONFIG_FILE)
+    end)
+
+    if okFile and exists and readfile then
+        local okRead, contents = pcall(function()
+            return readfile(CONFIG_FILE)
+        end)
+
+        if okRead and contents and contents ~= "" then
+            local okJson, decoded = pcall(function()
+                return HttpService:JSONDecode(contents)
+            end)
+
+            if okJson and type(decoded) == "table" then
+                deepMerge(decoded, DEFAULT_CONFIG)
+                cfg = decoded
+            end
+        end
+    end
+
+    return cfg
+end
+
+local config = loadConfig()
+
+local function saveConfig()
+    if not writefile then
+        return
+    end
+
+    pcall(function()
+        writefile(CONFIG_FILE, HttpService:JSONEncode(config))
+    end)
+end
+
+config.stats.scriptStarts += 1
+
+if config.runtime.lastJobId ~= "" and config.runtime.lastJobId ~= game.JobId then
+    config.stats.autoExecCount += 1
+    config.stats.rejoinCount += 1
+end
+
+config.runtime.lastJobId = game.JobId
+config.runtime.lastPlaceId = game.PlaceId
+config.runtime.lastStartUnix = os.time()
+saveConfig()
+
+local farmEnabled        = config.farmEnabled
+local isWalking          = false
+local eggQueue           = {}
+local queuedIds          = {}
+local trackedEggs        = {}
+local lastMoveTick       = tick()
+local autoExecEnabled    = config.autoExecEnabled
+local autoRefreshEnabled = config.autoRefreshEnabled
+local refreshMinutes     = tonumber(config.refreshMinutes) or 20
 
 -- anti afk
 local antiAfkEnabled = true
-local jumpInterval = 30
+local jumpInterval = tonumber(config.jumpInterval) or 30
 
 -- recorder
 local recordedInputs = {}
 local isRecording = false
 local isPlayingRecording = false
 local repeatRecording = false
-local repeatInterval = 10
+local repeatInterval = tonumber(config.repeatInterval) or 10
 local recordStartTime = 0
+
+shared.toggled = farmEnabled
+shared.autoExecEnabled = autoExecEnabled
+
+local function syncConfig()
+    config.farmEnabled = farmEnabled
+    config.autoExecEnabled = autoExecEnabled
+    config.autoRefreshEnabled = autoRefreshEnabled
+    config.refreshMinutes = refreshMinutes
+    config.jumpInterval = jumpInterval
+    config.repeatInterval = repeatInterval
+    shared.toggled = farmEnabled
+    shared.autoExecEnabled = autoExecEnabled
+    saveConfig()
+end
 
 local function isAlive(inst)
     return inst ~= nil and inst.Parent ~= nil
@@ -122,8 +241,7 @@ local function classifyEgg(v)
 end
 
 local function getDistanceToTarget(target)
-    local char = getChar()
-    local root = getRoot(char)
+    local root = getRoot(getChar())
     local pos = resolvePos(target)
 
     if not root or not pos then
@@ -449,6 +567,8 @@ local function scanAllEggs()
     for _, v in ipairs(workspace:GetDescendants()) do
         queueEgg(v)
     end
+
+    sortQueue()
 end
 
 local function releaseWalking()
@@ -514,8 +634,65 @@ local function onPossibleEgg(v)
     end)
 end
 
+local function getRequestFunc()
+    return request
+        or http_request
+        or (syn and syn.request)
+        or (fluxus and fluxus.request)
+end
+
+local function sendWebhookMessage(message)
+    local webhookUrl = tostring(config.webhookUrl or "")
+    if webhookUrl == "" then
+        return
+    end
+
+    local req = getRequestFunc()
+    if not req then
+        return
+    end
+
+    task.spawn(function()
+        pcall(function()
+            req({
+                Url = webhookUrl,
+                Method = "POST",
+                Headers = {
+                    ["Content-Type"] = "application/json"
+                },
+                Body = HttpService:JSONEncode({
+                    content = message
+                })
+            })
+        end)
+    end)
+end
+
+local function buildStatusText(reason)
+    return string.format(
+        "**EggBot status**\nReason: %s\nPlayer: %s\nPlaceId: %s\nJobId: %s\nFarm: %s\nAutoExec: %s\nAutoRefresh: %s\nRefreshMinutes: %s\nScriptStarts: %s\nAutoExecCount: %s\nRejoinCount: %s\nSoftRefreshCount: %s",
+        reason,
+        tostring(player.Name),
+        tostring(game.PlaceId),
+        tostring(game.JobId),
+        farmEnabled and "ON" or "OFF",
+        autoExecEnabled and "ON" or "OFF",
+        autoRefreshEnabled and "ON" or "OFF",
+        tostring(refreshMinutes),
+        tostring(config.stats.scriptStarts),
+        tostring(config.stats.autoExecCount),
+        tostring(config.stats.rejoinCount),
+        tostring(config.stats.softRefreshCount)
+    )
+end
+
 local function setupAutoExec()
     if not autoExecEnabled then
+        return
+    end
+
+    if RAW_SCRIPT_URL == "" or RAW_SCRIPT_URL == "PASTE_YOUR_RAW_GITHUB_LINK_HERE" then
+        warn("[EggBot] RAW_SCRIPT_URL not set")
         return
     end
 
@@ -524,9 +701,31 @@ local function setupAutoExec()
         or (syn and syn.queue_on_teleport)
 
     if qot then
-        qot([[
-loadstring(game:HttpGet("YOUR_RAW_SCRIPT_URL_HERE"))()
-        ]])
+        qot(string.format('loadstring(game:HttpGet("%s"))()', RAW_SCRIPT_URL))
+    else
+        warn("[EggBot] queue_on_teleport not available")
+    end
+end
+
+local function softRefreshMacro()
+    isWalking = false
+
+    eggQueue = {}
+    queuedIds = {}
+    trackedEggs = {}
+
+    local activePath = workspace:FindFirstChild("ActivePath")
+    if activePath then
+        pcall(function()
+            activePath:Destroy()
+        end)
+    end
+
+    scanAllEggs()
+
+    if farmEnabled then
+        task.wait(0.2)
+        processQueue()
     end
 end
 
@@ -613,7 +812,7 @@ screenGui.ResetOnSpawn = false
 screenGui.Parent = playerGui
 
 local frame = Instance.new("Frame")
-frame.Size = UDim2.new(0, 300, 0, 365)
+frame.Size = UDim2.new(0, 320, 0, 610)
 frame.Position = UDim2.new(0, 20, 0, 120)
 frame.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
 frame.BorderSizePixel = 0
@@ -634,7 +833,7 @@ title.Font = Enum.Font.SourceSansBold
 title.Parent = frame
 
 local toggleButton = Instance.new("TextButton")
-toggleButton.Size = UDim2.new(0, 260, 0, 35)
+toggleButton.Size = UDim2.new(0, 280, 0, 35)
 toggleButton.Position = UDim2.new(0, 20, 0, 40)
 toggleButton.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
 toggleButton.TextColor3 = Color3.fromRGB(255, 255, 255)
@@ -648,7 +847,7 @@ toggleCorner.CornerRadius = UDim.new(0, 8)
 toggleCorner.Parent = toggleButton
 
 local jumpLabel = Instance.new("TextLabel")
-jumpLabel.Size = UDim2.new(0, 260, 0, 20)
+jumpLabel.Size = UDim2.new(0, 280, 0, 20)
 jumpLabel.Position = UDim2.new(0, 20, 0, 85)
 jumpLabel.BackgroundTransparency = 1
 jumpLabel.Text = "Jump every X seconds:"
@@ -658,7 +857,7 @@ jumpLabel.TextScaled = true
 jumpLabel.Parent = frame
 
 local jumpBox = Instance.new("TextBox")
-jumpBox.Size = UDim2.new(0, 260, 0, 28)
+jumpBox.Size = UDim2.new(0, 280, 0, 28)
 jumpBox.Position = UDim2.new(0, 20, 0, 108)
 jumpBox.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
 jumpBox.TextColor3 = Color3.fromRGB(255, 255, 255)
@@ -674,7 +873,7 @@ jumpCorner.CornerRadius = UDim.new(0, 8)
 jumpCorner.Parent = jumpBox
 
 local recordButton = Instance.new("TextButton")
-recordButton.Size = UDim2.new(0, 125, 0, 35)
+recordButton.Size = UDim2.new(0, 135, 0, 35)
 recordButton.Position = UDim2.new(0, 20, 0, 148)
 recordButton.BackgroundColor3 = Color3.fromRGB(70, 70, 70)
 recordButton.TextColor3 = Color3.fromRGB(255, 255, 255)
@@ -688,8 +887,8 @@ recordCorner.CornerRadius = UDim.new(0, 8)
 recordCorner.Parent = recordButton
 
 local testButton = Instance.new("TextButton")
-testButton.Size = UDim2.new(0, 125, 0, 35)
-testButton.Position = UDim2.new(0, 155, 0, 148)
+testButton.Size = UDim2.new(0, 135, 0, 35)
+testButton.Position = UDim2.new(0, 165, 0, 148)
 testButton.BackgroundColor3 = Color3.fromRGB(70, 70, 70)
 testButton.TextColor3 = Color3.fromRGB(255, 255, 255)
 testButton.Font = Enum.Font.SourceSansBold
@@ -702,7 +901,7 @@ testCorner.CornerRadius = UDim.new(0, 8)
 testCorner.Parent = testButton
 
 local repeatLabel = Instance.new("TextLabel")
-repeatLabel.Size = UDim2.new(0, 260, 0, 20)
+repeatLabel.Size = UDim2.new(0, 280, 0, 20)
 repeatLabel.Position = UDim2.new(0, 20, 0, 194)
 repeatLabel.BackgroundTransparency = 1
 repeatLabel.Text = "Run recording every X seconds:"
@@ -712,7 +911,7 @@ repeatLabel.TextScaled = true
 repeatLabel.Parent = frame
 
 local repeatBox = Instance.new("TextBox")
-repeatBox.Size = UDim2.new(0, 260, 0, 28)
+repeatBox.Size = UDim2.new(0, 280, 0, 28)
 repeatBox.Position = UDim2.new(0, 20, 0, 217)
 repeatBox.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
 repeatBox.TextColor3 = Color3.fromRGB(255, 255, 255)
@@ -728,7 +927,7 @@ repeatCorner.CornerRadius = UDim.new(0, 8)
 repeatCorner.Parent = repeatBox
 
 local repeatToggle = Instance.new("TextButton")
-repeatToggle.Size = UDim2.new(0, 260, 0, 35)
+repeatToggle.Size = UDim2.new(0, 280, 0, 35)
 repeatToggle.Position = UDim2.new(0, 20, 0, 258)
 repeatToggle.BackgroundColor3 = Color3.fromRGB(70, 70, 70)
 repeatToggle.TextColor3 = Color3.fromRGB(255, 255, 255)
@@ -742,8 +941,8 @@ repeatToggleCorner.CornerRadius = UDim.new(0, 8)
 repeatToggleCorner.Parent = repeatToggle
 
 local autoExecButton = Instance.new("TextButton")
-autoExecButton.Size = UDim2.new(0, 260, 0, 35)
-autoExecButton.Position = UDim2.new(0, 20, 0, 300)
+autoExecButton.Size = UDim2.new(0, 280, 0, 35)
+autoExecButton.Position = UDim2.new(0, 20, 0, 304)
 autoExecButton.BackgroundColor3 = Color3.fromRGB(70, 70, 70)
 autoExecButton.TextColor3 = Color3.fromRGB(255, 255, 255)
 autoExecButton.Font = Enum.Font.SourceSansBold
@@ -755,9 +954,100 @@ local autoExecCorner = Instance.new("UICorner")
 autoExecCorner.CornerRadius = UDim.new(0, 8)
 autoExecCorner.Parent = autoExecButton
 
+local autoRefreshButton = Instance.new("TextButton")
+autoRefreshButton.Size = UDim2.new(0, 280, 0, 35)
+autoRefreshButton.Position = UDim2.new(0, 20, 0, 350)
+autoRefreshButton.BackgroundColor3 = Color3.fromRGB(70, 70, 70)
+autoRefreshButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+autoRefreshButton.Font = Enum.Font.SourceSansBold
+autoRefreshButton.TextScaled = true
+autoRefreshButton.Text = autoRefreshEnabled and "Soft Refresh: ON" or "Soft Refresh: OFF"
+autoRefreshButton.Parent = frame
+
+local autoRefreshCorner = Instance.new("UICorner")
+autoRefreshCorner.CornerRadius = UDim.new(0, 8)
+autoRefreshCorner.Parent = autoRefreshButton
+
+local refreshLabel = Instance.new("TextLabel")
+refreshLabel.Size = UDim2.new(0, 280, 0, 20)
+refreshLabel.Position = UDim2.new(0, 20, 0, 395)
+refreshLabel.BackgroundTransparency = 1
+refreshLabel.Text = "Soft refresh every X minutes:"
+refreshLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+refreshLabel.Font = Enum.Font.SourceSans
+refreshLabel.TextScaled = true
+refreshLabel.Parent = frame
+
+local refreshBox = Instance.new("TextBox")
+refreshBox.Size = UDim2.new(0, 280, 0, 28)
+refreshBox.Position = UDim2.new(0, 20, 0, 418)
+refreshBox.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+refreshBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+refreshBox.PlaceholderText = "Enter minutes"
+refreshBox.Text = tostring(refreshMinutes)
+refreshBox.Font = Enum.Font.SourceSans
+refreshBox.TextScaled = true
+refreshBox.ClearTextOnFocus = false
+refreshBox.Parent = frame
+
+local refreshCorner = Instance.new("UICorner")
+refreshCorner.CornerRadius = UDim.new(0, 8)
+refreshCorner.Parent = refreshBox
+
+local webhookLabel = Instance.new("TextLabel")
+webhookLabel.Size = UDim2.new(0, 280, 0, 20)
+webhookLabel.Position = UDim2.new(0, 20, 0, 455)
+webhookLabel.BackgroundTransparency = 1
+webhookLabel.Text = "Discord webhook (text only):"
+webhookLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+webhookLabel.Font = Enum.Font.SourceSans
+webhookLabel.TextScaled = true
+webhookLabel.Parent = frame
+
+local webhookBox = Instance.new("TextBox")
+webhookBox.Size = UDim2.new(0, 280, 0, 28)
+webhookBox.Position = UDim2.new(0, 20, 0, 478)
+webhookBox.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+webhookBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+webhookBox.PlaceholderText = "Paste webhook URL"
+webhookBox.Text = tostring(config.webhookUrl or "")
+webhookBox.Font = Enum.Font.SourceSans
+webhookBox.TextScaled = false
+webhookBox.ClearTextOnFocus = false
+webhookBox.TextXAlignment = Enum.TextXAlignment.Left
+webhookBox.Parent = frame
+
+local webhookCorner = Instance.new("UICorner")
+webhookCorner.CornerRadius = UDim.new(0, 8)
+webhookCorner.Parent = webhookBox
+
+local statsLabel = Instance.new("TextLabel")
+statsLabel.Size = UDim2.new(0, 280, 0, 80)
+statsLabel.Position = UDim2.new(0, 20, 0, 520)
+statsLabel.BackgroundTransparency = 1
+statsLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+statsLabel.Font = Enum.Font.SourceSans
+statsLabel.TextScaled = false
+statsLabel.TextWrapped = true
+statsLabel.TextXAlignment = Enum.TextXAlignment.Left
+statsLabel.TextYAlignment = Enum.TextYAlignment.Top
+statsLabel.Parent = frame
+
+local function updateStatsLabel()
+    statsLabel.Text =
+        "Starts: " .. tostring(config.stats.scriptStarts) ..
+        " | AutoExec: " .. tostring(config.stats.autoExecCount) ..
+        " | Rejoins: " .. tostring(config.stats.rejoinCount) ..
+        "\nSoftRefresh: " .. tostring(config.stats.softRefreshCount) ..
+        " | Farm: " .. (farmEnabled and "ON" or "OFF") ..
+        " | AutoRefresh: " .. (autoRefreshEnabled and "ON" or "OFF")
+end
+
+updateStatsLabel()
+
 toggleButton.MouseButton1Click:Connect(function()
     farmEnabled = not farmEnabled
-    shared.toggled = farmEnabled
+    syncConfig()
     toggleButton.Text = farmEnabled and "Macro: ON" or "Macro: OFF"
 
     if farmEnabled then
@@ -767,6 +1057,7 @@ toggleButton.MouseButton1Click:Connect(function()
     else
         isWalking = false
     end
+    updateStatsLabel()
 end)
 
 jumpBox.FocusLost:Connect(function()
@@ -775,6 +1066,7 @@ jumpBox.FocusLost:Connect(function()
         jumpInterval = num
     end
     jumpBox.Text = tostring(jumpInterval)
+    syncConfig()
 end)
 
 repeatBox.FocusLost:Connect(function()
@@ -783,6 +1075,22 @@ repeatBox.FocusLost:Connect(function()
         repeatInterval = num
     end
     repeatBox.Text = tostring(repeatInterval)
+    syncConfig()
+end)
+
+refreshBox.FocusLost:Connect(function()
+    local num = tonumber(refreshBox.Text)
+    if num and num > 0 then
+        refreshMinutes = math.max(1, math.floor(num))
+    end
+    refreshBox.Text = tostring(refreshMinutes)
+    syncConfig()
+    updateStatsLabel()
+end)
+
+webhookBox.FocusLost:Connect(function()
+    config.webhookUrl = webhookBox.Text or ""
+    saveConfig()
 end)
 
 recordButton.MouseButton1Click:Connect(function()
@@ -806,12 +1114,20 @@ end)
 
 autoExecButton.MouseButton1Click:Connect(function()
     autoExecEnabled = not autoExecEnabled
-    shared.autoExecEnabled = autoExecEnabled
+    syncConfig()
     autoExecButton.Text = autoExecEnabled and "Auto Exec: ON" or "Auto Exec: OFF"
 
     if autoExecEnabled then
         setupAutoExec()
     end
+    updateStatsLabel()
+end)
+
+autoRefreshButton.MouseButton1Click:Connect(function()
+    autoRefreshEnabled = not autoRefreshEnabled
+    syncConfig()
+    autoRefreshButton.Text = autoRefreshEnabled and "Soft Refresh: ON" or "Soft Refresh: OFF"
+    updateStatsLabel()
 end)
 
 local dragging = false
@@ -872,16 +1188,6 @@ task.spawn(function()
     end
 end)
 
-workspace.DescendantAdded:Connect(onPossibleEgg)
-
-task.spawn(function()
-    task.wait(1)
-    scanAllEggs()
-    if farmEnabled then
-        processQueue()
-    end
-end)
-
 task.spawn(function()
     while true do
         task.wait(RESCAN_INTERVAL)
@@ -892,24 +1198,65 @@ task.spawn(function()
     end
 end)
 
+task.spawn(function()
+    while true do
+        task.wait(1)
+
+        if autoRefreshEnabled then
+            local refreshSeconds = math.max(60, refreshMinutes * 60)
+            local elapsed = os.time() - (config.runtime.lastStartUnix or os.time())
+
+            if elapsed >= refreshSeconds then
+                config.stats.softRefreshCount += 1
+                config.runtime.lastStartUnix = os.time()
+                saveConfig()
+                updateStatsLabel()
+
+                softRefreshMacro()
+                sendWebhookMessage(buildStatusText("Scheduled soft refresh"))
+            end
+        end
+    end
+end)
+
+workspace.DescendantAdded:Connect(onPossibleEgg)
+
+task.spawn(function()
+    task.wait(1)
+    scanAllEggs()
+    if farmEnabled then
+        processQueue()
+    end
+end)
+
 player.Chatted:Connect(function(msg)
     local cmd = msg:lower():match("^/e%s+farm%s+(%a+)$")
     if cmd == "on" then
         farmEnabled = true
-        shared.toggled = true
+        syncConfig()
         toggleButton.Text = "Macro: ON"
         lastMoveTick = tick()
         scanAllEggs()
         processQueue()
     elseif cmd == "off" then
         farmEnabled = false
-        shared.toggled = false
+        syncConfig()
         toggleButton.Text = "Macro: OFF"
         isWalking = false
     end
+    updateStatsLabel()
 end)
 
-shared.autoExecEnabled = autoExecEnabled
 setupAutoExec()
+updateStatsLabel()
 
-print("[EggBot] Bot Loaded - Distance Aware Priority + UI + Anti AFK + Recorder + Auto Exec + Improved Pathfinding!")
+if farmEnabled then
+    task.delay(1.5, function()
+        scanAllEggs()
+        processQueue()
+    end)
+end
+
+sendWebhookMessage(buildStatusText("Script loaded"))
+
+print("[EggBot] Bot Loaded - Saved State + Auto Exec + Soft Refresh + Webhook Text Status!")
