@@ -29,6 +29,9 @@ local STUCK_ESCAPE_THRESHOLD = 2    -- consecutive stuck_hard results before esc
 local DETOUR_MAX_DISTANCE    = 20   -- studs from waypoint to consider a detour egg
 local DETOUR_PATH_OVERHEAD   = 1.25 -- egg must not be >25% further from final target
 
+-- FIX 2: max times an egg can be re-queued before being permanently blacklisted
+local MAX_EGG_ATTEMPTS = 5
+
 local EGG_COLORS = {
     [1] = Color3.fromRGB(255, 255, 255),
     [2] = Color3.fromRGB(0,   255, 0),
@@ -38,8 +41,14 @@ local EGG_COLORS = {
     [6] = Color3.fromRGB(255, 0,   0),
 }
 local JUMP_COLOR     = Color3.fromRGB(255, 100, 0)
-local POTION_COLOR   = Color3.fromRGB(170, 0,   255)
+local POTION_COLOR   = Color3.fromRGB(255, 0, 200)
 local DEFAULT_COLOR  = Color3.new(1, 1, 1)
+
+-- FIX 2: blacklist for permanently unreachable eggs
+local eggBlacklist = {}
+
+-- FIX 6: dirty flag so sortQueue only runs when the queue actually changed
+local queueDirty = false
 
 local function cloneTable(t)
     local out = {}
@@ -214,16 +223,17 @@ local function classifyEgg(v)
         return nil
     end
 
-    local name    = v.Name
-    local eggNum  = tonumber(string.match(name, "egg_(%d+)$"))
-    local isPotion = string.find(name, "potion", 1, true) ~= nil
+    local name = v.Name
 
-    if eggNum then
-        return { color = EGG_COLORS[eggNum] or DEFAULT_COLOR, priority = eggNum }
+    -- Potions are highest priority (7 puts them above egg_6)
+    if string.find(name, "potion", 1, true) then
+        return { color = POTION_COLOR, priority = 7 }
     end
 
-    if isPotion then
-        return { color = POTION_COLOR, priority = 0 }
+    -- egg_6 down to egg_1
+    local eggNum = tonumber(string.match(name, "egg_(%d+)$"))
+    if eggNum then
+        return { color = EGG_COLORS[eggNum] or DEFAULT_COLOR, priority = eggNum }
     end
 
     return nil
@@ -236,7 +246,15 @@ local function getDistanceToTarget(target)
     return (root.Position - pos).Magnitude
 end
 
-local function sortQueue()
+-- FIX 6: only sort when something actually changed
+local function markQueueDirty()
+    queueDirty = true
+end
+
+local function sortQueueIfDirty()
+    if not queueDirty then return end
+    queueDirty = false
+
     table.sort(eggQueue, function(a, b)
         if a.priority ~= b.priority then
             return a.priority > b.priority
@@ -251,6 +269,12 @@ local function sortQueue()
 
         return a.firstSeen < b.firstSeen
     end)
+end
+
+-- Keep old name as alias so all call sites work without changes
+local function sortQueue()
+    markQueueDirty()
+    sortQueueIfDirty()
 end
 
 local function makePathFolder(waypoints, eggColor)
@@ -308,15 +332,25 @@ local function buildRayParams(char)
 end
 
 -- ─── ESCAPE MANEUVER ─────────────────────────────────────────────────────────
--- Triggered after STUCK_ESCAPE_THRESHOLD consecutive hard-stucks.
--- Strafes randomly left or right for 3 seconds, then jumps to shake loose.
-local function doEscapeManeuver(hum, root)
+-- FIX 1: remember last escape direction per egg uid and flip it next time
+local lastEscapeDir = {}
+
+local function doEscapeManeuver(hum, root, eggUid)
     if not hum or not root then return end
 
     hum:MoveTo(root.Position)
     task.wait(0.1)
 
-    local side      = (math.random(0, 1) == 0) and -1 or 1
+    -- FIX 1: flip direction from last attempt, default random on first
+    local lastDir = lastEscapeDir[eggUid]
+    local side
+    if lastDir then
+        side = -lastDir
+    else
+        side = (math.random(0, 1) == 0) and -1 or 1
+    end
+    lastEscapeDir[eggUid] = side
+
     local strafeDir = root.CFrame.RightVector * side
 
     local escapeStart = tick()
@@ -327,7 +361,8 @@ local function doEscapeManeuver(hum, root)
     end
 
     doJump(hum)
-    task.wait(0.4)
+    -- FIX 5: wait a frame so ComputeAsync uses the post-escape position
+    task.wait(0.2)
 end
 
 -- ─── STEP TO WAYPOINT ────────────────────────────────────────────────────────
@@ -391,7 +426,6 @@ local function stepToWaypoint(hum, root, wp)
                 end
                 local ceilingRay = workspace:Raycast(root.Position, Vector3.new(0, 3.5, 0), rayParams)
 
-                -- After 3 micro-stucks on a single waypoint, escalate to caller
                 if stuckCount >= 3 then
                     result = "stuck_hard"
                     break
@@ -435,12 +469,14 @@ local function stepToWaypoint(hum, root, wp)
 end
 
 -- ─── WALK TO EGG ─────────────────────────────────────────────────────────────
--- Forward-declare so grabNearbyEgg (defined inside walkToEgg) can call back in.
 local walkToEgg
 
-local function grabNearbyEgg(currentWpPos, targetPos)
+local function grabNearbyEgg(currentWpPos, targetPos, primaryTarget)
     for _, data in ipairs(eggQueue) do
         if not isAlive(data.target) then continue end
+        -- FIX 4: never try to detour to the egg we're already walking toward
+        if data.target == primaryTarget then continue end
+
         local eggPos = resolvePos(data.target)
         if not eggPos then continue end
 
@@ -448,8 +484,6 @@ local function grabNearbyEgg(currentWpPos, targetPos)
         local distEggToFinal = (eggPos - targetPos).Magnitude
         local distWpToFinal  = (currentWpPos - targetPos).Magnitude
 
-        -- Grab if the egg is within DETOUR_MAX_DISTANCE of our current position
-        -- AND it doesn't take us more than DETOUR_PATH_OVERHEAD further from the goal
         if distToEgg <= DETOUR_MAX_DISTANCE
             and distEggToFinal <= distWpToFinal * DETOUR_PATH_OVERHEAD
         then
@@ -460,11 +494,12 @@ local function grabNearbyEgg(currentWpPos, targetPos)
                 for i, e in ipairs(eggQueue) do
                     if e.id == data.id then
                         table.remove(eggQueue, i)
+                        markQueueDirty()
                         break
                     end
                 end
             end
-            return -- only one detour per waypoint to avoid recursion spirals
+            return
         end
     end
 end
@@ -476,6 +511,7 @@ walkToEgg = function(targetInstance, eggColor)
 
     if not hum or not root then return "fail" end
 
+    local uid = buildUid(targetInstance)
     local consecutiveStucks = 0
 
     for attempt = 1, MAX_PATH_ATTEMPTS do
@@ -484,12 +520,10 @@ walkToEgg = function(targetInstance, eggColor)
         local targetPos = resolvePos(targetInstance)
         if not targetPos then return "done" end
 
-        -- If hard-stuck enough times in a row, run the escape maneuver then repath
         if consecutiveStucks >= STUCK_ESCAPE_THRESHOLD then
             print("[EggBot] Hard stuck x" .. consecutiveStucks .. " — running escape maneuver")
-            doEscapeManeuver(hum, root)
+            doEscapeManeuver(hum, root, uid)
             consecutiveStucks = 0
-            -- Refresh refs after maneuver in case character respawned
             char = getChar()
             hum  = getHum(char)
             root = getRoot(char)
@@ -528,7 +562,6 @@ walkToEgg = function(targetInstance, eggColor)
             local stepResult = stepToWaypoint(hum, root, wp)
 
             if stepResult == "stuck_hard" then
-                -- Increment and break out so the escape check fires at loop top
                 consecutiveStucks += 1
                 pathBroken = true
                 break
@@ -538,11 +571,10 @@ walkToEgg = function(targetInstance, eggColor)
                 break
 
             else
-                -- Clean step — reset stuck counter and check for opportunistic detours
                 consecutiveStucks = 0
-                -- Skip the last two waypoints to avoid overshooting the primary target
                 if i < #waypoints - 1 then
-                    grabNearbyEgg(wp.Position, targetPos)
+                    -- FIX 4: pass primaryTarget so we never detour to ourselves
+                    grabNearbyEgg(wp.Position, targetPos, targetInstance)
                 end
             end
         end
@@ -564,6 +596,9 @@ walkToEgg = function(targetInstance, eggColor)
                 end
             end
         end
+
+        -- FIX 1: clear escape direction memory on success
+        lastEscapeDir[uid] = nil
 
         task.wait(0.1)
         return "done"
@@ -592,8 +627,10 @@ local function pruneQueue()
             trackedEggs[e.id] = nil
         end
     end
+    local changed = #alive ~= #eggQueue
     eggQueue = alive
-    sortQueue()
+    if changed then markQueueDirty() end
+    sortQueueIfDirty()
 end
 
 local function queueEgg(v)
@@ -603,6 +640,8 @@ local function queueEgg(v)
 
     local uid = buildUid(v)
     if trackedEggs[uid] then return end
+    -- FIX 2: skip permanently blacklisted eggs
+    if eggBlacklist[uid] then return end
 
     local data = {
         target    = v,
@@ -610,6 +649,7 @@ local function queueEgg(v)
         id        = uid,
         firstSeen = tick(),
         priority  = info.priority,
+        attempts  = 0,  -- FIX 2: track how many times this egg has been re-queued
     }
 
     trackedEggs[uid] = data
@@ -617,7 +657,7 @@ local function queueEgg(v)
     if not queuedIds[uid] then
         queuedIds[uid] = true
         table.insert(eggQueue, data)
-        sortQueue()
+        markQueueDirty()
     end
 end
 
@@ -629,7 +669,7 @@ local function scanAllEggs()
         queueEgg(v)
     end
 
-    sortQueue()
+    sortQueueIfDirty()
 end
 
 local function releaseWalking()
@@ -646,7 +686,7 @@ local function processQueue()
         end)
 
         pruneQueue()
-        sortQueue()
+        sortQueueIfDirty()
 
         local data = table.remove(eggQueue, 1)
 
@@ -658,16 +698,23 @@ local function processQueue()
 
                 if result == "done" or not isAlive(data.target) then
                     trackedEggs[data.id] = nil
+                    lastEscapeDir[data.id] = nil
                 else
-                    if isAlive(data.target) then
-                        if not queuedIds[data.id] then
-                            queuedIds[data.id] = true
-                            data.firstSeen     = data.firstSeen or tick()
-                            table.insert(eggQueue, data)
-                            sortQueue()
-                        end
+                    -- FIX 2: increment attempt count and blacklist if over limit
+                    data.attempts = (data.attempts or 0) + 1
+                    if data.attempts >= MAX_EGG_ATTEMPTS then
+                        warn("[EggBot] Blacklisting unreachable egg: " .. data.id)
+                        eggBlacklist[data.id] = true
+                        trackedEggs[data.id]  = nil
+                        lastEscapeDir[data.id] = nil
                     else
-                        trackedEggs[data.id] = nil
+                        if isAlive(data.target) and not queuedIds[data.id] then
+                            queuedIds[data.id] = true
+                            table.insert(eggQueue, data)
+                            markQueueDirty()
+                        else
+                            trackedEggs[data.id] = nil
+                        end
                     end
                 end
             else
@@ -689,7 +736,10 @@ local function onPossibleEgg(v)
     task.spawn(function()
         task.wait(0.05)
         queueEgg(v)
-        if farmEnabled then processQueue() end
+        if farmEnabled then
+            sortQueueIfDirty()
+            processQueue()
+        end
     end)
 end
 
@@ -764,6 +814,8 @@ local function softRefreshMacro()
     eggQueue    = {}
     queuedIds   = {}
     trackedEggs = {}
+    -- Note: we intentionally keep eggBlacklist alive across soft refreshes
+    -- so the bot doesn't immediately re-attempt known bad eggs
 
     local activePath = workspace:FindFirstChild("ActivePath")
     if activePath then
@@ -1198,9 +1250,11 @@ UIS.InputChanged:Connect(function(input)
 end)
 
 -- ─── BACKGROUND LOOPS ────────────────────────────────────────────────────────
+
+-- FIX 3: anti-AFK loop reads jumpInterval each iteration so UI changes take effect live
 task.spawn(function()
     while true do
-        task.wait(jumpInterval)
+        task.wait(jumpInterval)  -- re-reads the upvalue each loop
         if farmEnabled and antiAfkEnabled then
             local hum = getHum(getChar())
             if hum then doJump(hum) end
