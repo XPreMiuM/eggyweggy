@@ -15,7 +15,7 @@ local PATH_PARAMS = {
     AgentRadius     = 2,
     AgentCanJump    = true,
     AgentJumpHeight = 35,
-    WaypointSpacing = shared.spacing or 3,
+    WaypointSpacing = 1,
     Costs           = { Water = math.huge },
 }
 
