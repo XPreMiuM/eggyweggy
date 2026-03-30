@@ -16,9 +16,7 @@ local PATH_PARAMS = {
     AgentCanJump    = true,
     AgentJumpHeight = 35,
     WaypointSpacing = shared.spacing or 3,
-    Costs = {
-        Water = math.huge,
-    },
+    Costs = { Water = math.huge },
 }
 
 local REACH_DIST             = 4.5
@@ -28,19 +26,106 @@ local MAX_PATH_ATTEMPTS      = 5
 local WALK_HARD_TIMEOUT      = 90
 local QUEUE_COOLDOWN         = 0.2
 local RESCAN_INTERVAL        = 5
-local STUCK_ESCAPE_THRESHOLD = 1   -- trigger escape after just 1 stuck_hard
+local STUCK_ESCAPE_THRESHOLD = 1
 local DETOUR_MAX_DISTANCE    = 20
 local DETOUR_PATH_OVERHEAD   = 1.25
 local FAIL_BEFORE_SKIP       = 3
 
+-- ─── INVISIBLE OBSTACLES ─────────────────────────────────────────────────────
+-- These are parts spawned at load time that the pathfinder treats as walls.
+-- CanCollide=true so PathfindingService routes around them.
+-- Transparency=1 so they are invisible to the player.
+-- Each entry: center, size, angleY (degrees around Y axis)
+local OBSTACLE_DEFS = {
+    { center=Vector3.new(321.8, 101.0, -382.4), size=Vector3.new(3.4,  8, 14.8), angleY=-3.8   },
+    { center=Vector3.new(321.2, 101.0, -399.9), size=Vector3.new(4.0,  8, 12.6), angleY=-1.0   },
+    { center=Vector3.new(278.0,  97.3, -433.3), size=Vector3.new(4.6,  8, 18.5), angleY=163.3  },
+    { center=Vector3.new(255.7,  97.2, -451.8), size=Vector3.new(4.6,  8, 17.8), angleY=127.4  },
+    { center=Vector3.new(114.3,  96.8, -431.8), size=Vector3.new(16.2, 8,  6.1), angleY=90.7   },
+    { center=Vector3.new(114.2,  97.0, -452.3), size=Vector3.new(15.1, 8,  5.8), angleY=-89.9  },
+}
+
+-- Spawn obstacle parts so pathfinder sees them as walls
+local obstacleFolder = Instance.new("Folder")
+obstacleFolder.Name  = "EggBotObstacles"
+obstacleFolder.Parent = workspace
+
+local spawnedObstacles = {}
+
+local function spawnObstacles()
+    for i, def in ipairs(OBSTACLE_DEFS) do
+        local p              = Instance.new("Part")
+        p.Name               = "EggBotWall_" .. i
+        p.Size               = def.size
+        p.CFrame             = CFrame.new(def.center) * CFrame.Angles(0, math.rad(def.angleY), 0)
+        p.Anchored           = true
+        p.CanCollide         = true   -- pathfinder respects this
+        p.Transparency       = 1      -- invisible
+        p.CanTouch           = false
+        p.CastShadow         = false
+        p.Parent             = obstacleFolder
+        table.insert(spawnedObstacles, p)
+    end
+end
+
+spawnObstacles()
+
+-- Check if a world position is inside or very close to any obstacle
+-- Returns the obstacle part if overlapping, nil otherwise
+local function getOverlappingObstacle(pos, margin)
+    margin = margin or 3
+    for _, part in ipairs(spawnedObstacles) do
+        -- Transform pos into part's local space
+        local localPos = part.CFrame:PointToObjectSpace(pos)
+        local halfSize = part.Size / 2 + Vector3.new(margin, margin, margin)
+        if math.abs(localPos.X) <= halfSize.X
+            and math.abs(localPos.Y) <= halfSize.Y
+            and math.abs(localPos.Z) <= halfSize.Z
+        then
+            return part
+        end
+    end
+    return nil
+end
+
+-- Find a position just outside an obstacle that the bot can path to
+-- before making a final approach to the egg
+local function getApproachPosition(eggPos, obstacle)
+    -- Try 8 directions around the obstacle, pick nearest accessible one
+    local best     = nil
+    local bestDist = math.huge
+    local root     = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+    if not root then return nil end
+
+    for angle = 0, 315, 45 do
+        local rad    = math.rad(angle)
+        -- Offset outward from obstacle center by half its size + margin
+        local halfX  = obstacle.Size.X / 2 + 4
+        local halfZ  = obstacle.Size.Z / 2 + 4
+        local offset = obstacle.CFrame:VectorToWorldSpace(
+            Vector3.new(math.cos(rad) * halfX, 0, math.sin(rad) * halfZ)
+        )
+        local candidate = obstacle.CFrame.Position + offset
+        candidate = Vector3.new(candidate.X, eggPos.Y, candidate.Z)
+
+        -- Make sure this candidate is not itself inside another obstacle
+        if not getOverlappingObstacle(candidate, 0) then
+            local distFromBot = (root.Position - candidate).Magnitude
+            if distFromBot < bestDist then
+                bestDist = distFromBot
+                best     = candidate
+            end
+        end
+    end
+
+    return best
+end
+
 -- ─── MANUAL PATHS ────────────────────────────────────────────────────────────
--- Island chain path 1: recorded manually, used when egg is in trigger zone
--- Trigger zone: any egg within 35 studs of (39.2, 96, -435.3)
 local ISLAND_PATH_1 = {
-    zone = { center = Vector3.new(39.2, 96, -435.3), radius = 35 },
-    -- Last solid land point before islands — bot pathfinds here first
+    zone       = { center = Vector3.new(39.2, 96, -435.3), radius = 35 },
     entryPoint = Vector3.new(109.6, 92.0, -425.8),
-    waypoints = {
+    waypoints  = {
         Vector3.new(109.6, 92.0, -425.8),
         Vector3.new(101.8, 99.5, -426.2),
         Vector3.new(95.4,  91.7, -426.6),
@@ -60,12 +145,13 @@ local ISLAND_PATH_1 = {
     },
 }
 
--- Blessing obby: recorded manually
--- Bot pathfinds to entryPoint then runs waypoints
--- Game TPs player back to spawn automatically at the end
+local SPAWN_POINT = Vector3.new(210.1, 92.5, -361.5)
+
+-- ─── OBBIES ──────────────────────────────────────────────────────────────────
 local BLESSING_OBBY = {
-    entryPoint = Vector3.new(175.0, 93.4, -567.8),
-    waypoints = {
+    entryPoint   = Vector3.new(175.0, 93.4, -567.8),
+    respawnAfter = false,
+    waypoints    = {
         Vector3.new(175.0,  93.4, -567.8),
         Vector3.new(175.5,  98.3, -573.2),
         Vector3.new(176.5,  97.1, -579.5),
@@ -128,8 +214,74 @@ local BLESSING_OBBY = {
     },
 }
 
--- Spawn point (used to detect respawn)
-local SPAWN_POINT = Vector3.new(210.1, 92.5, -361.5)
+local GRAIL_OBBY = {
+    entryPoint   = Vector3.new(570.0, 117.0, -289.8),
+    respawnAfter = true,
+    waypoints    = {
+        Vector3.new(570.0, 117.0, -289.8),
+        Vector3.new(570.0, 120.2, -285.9),
+        Vector3.new(570.0, 121.1, -281.1),
+        Vector3.new(570.0, 125.5, -281.1),
+        Vector3.new(570.0, 129.9, -281.1),
+        Vector3.new(570.0, 134.3, -281.1),
+        Vector3.new(570.0, 138.8, -281.1),
+        Vector3.new(570.0, 141.1, -279.0),
+        Vector3.new(570.0, 141.0, -277.5),
+        Vector3.new(566.2, 149.5, -278.7),
+        Vector3.new(563.9, 146.0, -278.7),
+        Vector3.new(563.9, 151.0, -278.4),
+        Vector3.new(563.9, 154.9, -275.4),
+        Vector3.new(563.9, 161.9, -271.0),
+        Vector3.new(563.9, 161.9, -264.7),
+        Vector3.new(564.0, 169.3, -258.4),
+        Vector3.new(564.7, 169.7, -252.3),
+        Vector3.new(565.5, 171.6, -246.1),
+        Vector3.new(566.0, 167.9, -242.8),
+        Vector3.new(569.9, 174.7, -242.5),
+        Vector3.new(570.2, 175.0, -239.9),
+        Vector3.new(570.5, 182.5, -234.8),
+        Vector3.new(570.6, 182.0, -232.5),
+        Vector3.new(571.4, 188.6, -228.1),
+        Vector3.new(571.3, 189.0, -225.3),
+        Vector3.new(574.1, 189.0, -225.2),
+        Vector3.new(575.0, 197.9, -225.3),
+        Vector3.new(575.4, 206.5, -224.4),
+        Vector3.new(575.6, 211.2, -224.5),
+        Vector3.new(577.0, 219.8, -222.7),
+        Vector3.new(577.1, 224.1, -222.6),
+        Vector3.new(577.1, 215.9, -222.6),
+        Vector3.new(578.3, 223.4, -221.6),
+        Vector3.new(580.5, 223.9, -217.6),
+        Vector3.new(578.2, 224.9, -212.1),
+        Vector3.new(579.5, 224.9, -210.0),
+        Vector3.new(582.8, 232.4, -204.6),
+        Vector3.new(584.6, 233.9, -201.0),
+        Vector3.new(583.9, 233.9, -195.6),
+        Vector3.new(583.9, 240.8, -189.7),
+        Vector3.new(584.0, 241.9, -187.4),
+        Vector3.new(584.0, 245.8, -187.4),
+        Vector3.new(586.2, 247.8, -185.3),
+        Vector3.new(586.2, 249.4, -185.3),
+        Vector3.new(589.2, 253.1, -185.5),
+        Vector3.new(589.2, 257.3, -185.6),
+        Vector3.new(589.0, 258.9, -190.0),
+        Vector3.new(589.0, 258.9, -193.1),
+        Vector3.new(589.0, 266.2, -199.1),
+        Vector3.new(589.0, 261.9, -205.2),
+        Vector3.new(589.5, 261.9, -211.5),
+        Vector3.new(590.2, 261.9, -217.7),
+        Vector3.new(597.7, 262.9, -216.8),
+        Vector3.new(604.0, 261.9, -216.9),
+        Vector3.new(607.3, 262.9, -217.1),
+        Vector3.new(607.3, 268.8, -217.1),
+        Vector3.new(607.3, 271.4, -216.3),
+        Vector3.new(607.3, 275.7, -216.3),
+        Vector3.new(607.3, 280.1, -216.3),
+        Vector3.new(607.1, 281.0, -212.4),
+        Vector3.new(605.4, 280.9, -208.6),
+        Vector3.new(605.7, 281.4, -202.5),
+    },
+}
 
 local EGG_COLORS = {
     [1] = Color3.fromRGB(255, 255, 255),
@@ -139,8 +291,8 @@ local EGG_COLORS = {
     [5] = Color3.fromRGB(255, 170, 0),
     [6] = Color3.fromRGB(255, 0,   0),
 }
-local JUMP_COLOR   = Color3.fromRGB(255, 100, 0)
-local POTION_COLOR = Color3.fromRGB(255, 0, 200)
+local JUMP_COLOR    = Color3.fromRGB(255, 100, 0)
+local POTION_COLOR  = Color3.fromRGB(255, 0, 200)
 local DEFAULT_COLOR = Color3.new(1, 1, 1)
 
 local queueDirty = false
@@ -148,36 +300,36 @@ local queueDirty = false
 local function cloneTable(t)
     local out = {}
     for k, v in pairs(t) do
-        if type(v) == "table" then
-            out[k] = cloneTable(v)
-        else
-            out[k] = v
-        end
+        if type(v) == "table" then out[k] = cloneTable(v)
+        else out[k] = v end
     end
     return out
 end
 
 local DEFAULT_CONFIG = {
-    farmEnabled = false,
-    autoExecEnabled = false,
+    farmEnabled        = false,
+    autoExecEnabled    = false,
     autoRefreshEnabled = false,
-    refreshMinutes = 20,
-    jumpInterval = 30,
-    repeatInterval = 10,
-    blessingEnabled = false,
-    blessingInterval = 10,
-    webhookUrl = "",
+    refreshMinutes     = 20,
+    jumpInterval       = 30,
+    repeatInterval     = 10,
+    blessingEnabled    = false,
+    blessingInterval   = 10,
+    grailEnabled       = false,
+    grailInterval      = 10,
+    webhookUrl         = "",
     stats = {
-        scriptStarts = 0,
-        autoExecCount = 0,
-        rejoinCount = 0,
+        scriptStarts     = 0,
+        autoExecCount    = 0,
+        rejoinCount      = 0,
         softRefreshCount = 0,
     },
     runtime = {
-        lastJobId = "",
-        lastPlaceId = 0,
-        lastStartUnix = 0,
+        lastJobId        = "",
+        lastPlaceId      = 0,
+        lastStartUnix    = 0,
         lastBlessingUnix = 0,
+        lastGrailUnix    = 0,
     }
 }
 
@@ -194,9 +346,7 @@ end
 
 local function loadConfig()
     local cfg = cloneTable(DEFAULT_CONFIG)
-    local okFile, exists = pcall(function()
-        return isfile and isfile(CONFIG_FILE)
-    end)
+    local okFile, exists = pcall(function() return isfile and isfile(CONFIG_FILE) end)
     if okFile and exists and readfile then
         local okRead, contents = pcall(function() return readfile(CONFIG_FILE) end)
         if okRead and contents and contents ~= "" then
@@ -238,7 +388,9 @@ local autoRefreshEnabled = config.autoRefreshEnabled
 local refreshMinutes     = tonumber(config.refreshMinutes) or 20
 local blessingEnabled    = config.blessingEnabled or false
 local blessingInterval   = tonumber(config.blessingInterval) or 10
-local isRunningBlessing  = false
+local grailEnabled       = config.grailEnabled or false
+local grailInterval      = tonumber(config.grailInterval) or 10
+local isRunningObby      = false
 
 local antiAfkEnabled = true
 local jumpInterval   = tonumber(config.jumpInterval) or 30
@@ -262,20 +414,15 @@ local function syncConfig()
     config.repeatInterval     = repeatInterval
     config.blessingEnabled    = blessingEnabled
     config.blessingInterval   = blessingInterval
+    config.grailEnabled       = grailEnabled
+    config.grailInterval      = grailInterval
     shared.toggled            = farmEnabled
     shared.autoExecEnabled    = autoExecEnabled
     saveConfig()
 end
 
-local function isAlive(inst)
-    return inst ~= nil and inst.Parent ~= nil
-end
-
-local function safeGet(fn)
-    local ok, val = pcall(fn)
-    return ok and val or nil
-end
-
+local function isAlive(inst) return inst ~= nil and inst.Parent ~= nil end
+local function safeGet(fn) local ok, val = pcall(fn) return ok and val or nil end
 local function getChar() return player.Character end
 local function getHum(c) return c and c:FindFirstChildOfClass("Humanoid") end
 local function getRoot(c) return c and c:FindFirstChild("HumanoidRootPart") end
@@ -292,9 +439,7 @@ local function resolvePos(inst)
     end)
 end
 
-local function buildUid(v)
-    return v.Name .. "_" .. v:GetDebugId()
-end
+local function buildUid(v) return v.Name .. "_" .. v:GetDebugId() end
 
 local function classifyEgg(v)
     if not v or not (v:IsA("Model") or v:IsA("BasePart")) then return nil end
@@ -322,9 +467,9 @@ local function sortQueueIfDirty()
     if not queueDirty then return end
     queueDirty = false
     table.sort(eggQueue, function(a, b)
-        local aPriority = a.priority - (a.failCount or 0)
-        local bPriority = b.priority - (b.failCount or 0)
-        if aPriority ~= bPriority then return aPriority > bPriority end
+        local ap = a.priority - (a.failCount or 0)
+        local bp = b.priority - (b.failCount or 0)
+        if ap ~= bp then return ap > bp end
         local da = getDistanceToTarget(a.target)
         local db = getDistanceToTarget(b.target)
         if math.abs(da - db) > 8 then return da < db end
@@ -332,10 +477,7 @@ local function sortQueueIfDirty()
     end)
 end
 
-local function sortQueue()
-    markQueueDirty()
-    sortQueueIfDirty()
-end
+local function sortQueue() markQueueDirty() sortQueueIfDirty() end
 
 local function makePathFolder(waypoints, eggColor)
     local folder = Instance.new("Folder")
@@ -376,9 +518,9 @@ end
 local function buildRayParams(char)
     local rp = RaycastParams.new()
     rp.FilterType = Enum.RaycastFilterType.Blacklist
-    local ignore     = {char}
-    local activePath = workspace:FindFirstChild("ActivePath")
-    if activePath then table.insert(ignore, activePath) end
+    local ignore = {char, obstacleFolder}
+    local ap = workspace:FindFirstChild("ActivePath")
+    if ap then table.insert(ignore, ap) end
     rp.FilterDescendantsInstances = ignore
     return rp
 end
@@ -391,7 +533,7 @@ local function doEscapeManeuver(hum, root, eggUid)
     hum:MoveTo(root.Position)
     task.wait(0.1)
     local lastDir = lastEscapeDir[eggUid]
-    local side = lastDir and -lastDir or ((math.random(0,1) == 0) and -1 or 1)
+    local side    = lastDir and -lastDir or ((math.random(0,1) == 0) and -1 or 1)
     lastEscapeDir[eggUid] = side
     local strafeDir   = root.CFrame.RightVector * side
     local escapeStart = tick()
@@ -405,8 +547,6 @@ local function doEscapeManeuver(hum, root, eggUid)
 end
 
 -- ─── MANUAL WAYPOINT WALKER ───────────────────────────────────────────────────
--- Walks a list of Vector3 positions directly, jumping when Y rises significantly.
--- Used for island paths and the blessing obby.
 local function walkManualPath(waypoints, jumpThreshold)
     jumpThreshold = jumpThreshold or 1.5
     local char = getChar()
@@ -415,9 +555,8 @@ local function walkManualPath(waypoints, jumpThreshold)
     if not hum or not root then return "fail" end
 
     for i, wp in ipairs(waypoints) do
-        if not farmEnabled and not isRunningBlessing then return "stopped" end
+        if not farmEnabled and not isRunningObby then return "stopped" end
 
-        -- Jump if next point is significantly higher
         if i < #waypoints then
             local nextWp = waypoints[i + 1]
             if nextWp.Y - root.Position.Y > jumpThreshold then
@@ -428,29 +567,25 @@ local function walkManualPath(waypoints, jumpThreshold)
 
         hum:MoveTo(wp)
 
-        local startT   = tick()
-        local lastPos  = root.Position
-        local stuckT   = tick()
+        local startT  = tick()
+        local lastPos = root.Position
+        local stuckT  = tick()
 
         while true do
             task.wait()
-
             local dist = (root.Position - wp).Magnitude
             if dist < REACH_DIST then break end
 
             if tick() - startT > WAYPOINT_TIMEOUT * 2 then
-                -- Timed out on this waypoint, try jumping and continuing
                 doJump(hum)
                 task.wait(0.3)
                 break
             end
 
-            -- Detect respawn (fell in water mid-manual-path)
-            if (root.Position - SPAWN_POINT).Magnitude < 10 then
+            if (root.Position - SPAWN_POINT).Magnitude < 15 then
                 return "respawned"
             end
 
-            -- Nudge if stuck
             if tick() - stuckT > 1.0 then
                 local moved = (root.Position - lastPos).Magnitude
                 if moved < 0.5 then
@@ -469,16 +604,17 @@ end
 -- ─── STEP TO WAYPOINT ────────────────────────────────────────────────────────
 local function stepToWaypoint(hum, root, wp)
     if not hum or not root then return "fail" end
-    local char = root.Parent
-    hum:MoveTo(wp.Position)
-    local result       = nil
-    local startT       = tick()
+    local char        = root.Parent
+    local result      = nil
+    local startT      = tick()
     local lastJumpTime = 0
-    local lastPos      = root.Position
-    local lastPosTime  = tick()
-    local stuckCount   = 0
+    local lastPos     = root.Position
+    local lastPosTime = tick()
+    local stuckCount  = 0
     local PROGRESS_CHECK_INTERVAL = 0.6
     local MIN_PROGRESS = 0.8
+
+    hum:MoveTo(wp.Position)
 
     local moveConn = hum.MoveToFinished:Connect(function(reached)
         if result == nil then result = reached and "reached" or "timeout" end
@@ -489,11 +625,9 @@ local function stepToWaypoint(hum, root, wp)
         if not farmEnabled then result = "stopped" break end
         if tick() - startT > WAYPOINT_TIMEOUT then result = "timeout" break end
 
-        -- Detect respawn
         local teleportDist = (root.Position - lastPos).Magnitude
         if teleportDist > 50 and (tick() - lastPosTime) < 0.5 then
-            result = "respawned"
-            break
+            result = "respawned" break
         end
 
         local dist = (root.Position - wp.Position).Magnitude
@@ -511,22 +645,20 @@ local function stepToWaypoint(hum, root, wp)
                 local dir     = (wp.Position - root.Position)
                 local flatDir = Vector3.new(dir.X, 0, dir.Z)
                 if flatDir.Magnitude > 0 then flatDir = flatDir.Unit end
-                local rayParams  = buildRayParams(char)
-                local frontRay   = flatDir.Magnitude > 0 and workspace:Raycast(root.Position, flatDir * 3, rayParams) or nil
-                local ceilingRay = workspace:Raycast(root.Position, Vector3.new(0, 3.5, 0), rayParams)
+                local rp      = buildRayParams(char)
+                local frontRay = flatDir.Magnitude > 0 and workspace:Raycast(root.Position, flatDir * 3, rp) or nil
+                local ceilRay  = workspace:Raycast(root.Position, Vector3.new(0, 3.5, 0), rp)
 
-                -- Lower threshold: escalate after 2 micro-stucks
                 if stuckCount >= 2 then result = "stuck_hard" break end
 
-                if frontRay and not ceilingRay and (now - lastJumpTime) > JUMP_COOLDOWN then
+                if frontRay and not ceilRay and (now - lastJumpTime) > JUMP_COOLDOWN then
                     lastJumpTime = now
                     doJump(hum)
                     hum:MoveTo(wp.Position)
                 elseif frontRay then
                     if flatDir.Magnitude > 0 then
-                        local side           = (math.random(0, 1) == 0) and -1 or 1
-                        local sidestepTarget = root.Position + root.CFrame.RightVector * side * 3
-                        hum:MoveTo(sidestepTarget)
+                        local side = (math.random(0,1) == 0) and -1 or 1
+                        hum:MoveTo(root.Position + root.CFrame.RightVector * side * 3)
                         task.wait(0.3)
                         hum:MoveTo(root.Position - flatDir * 2)
                         task.wait(0.35)
@@ -554,9 +686,7 @@ local function getManualPathForEgg(eggPos)
     for _, manualPath in ipairs({ ISLAND_PATH_1 }) do
         local zone = manualPath.zone
         local dist = Vector3.new(eggPos.X - zone.center.X, 0, eggPos.Z - zone.center.Z).Magnitude
-        if dist <= zone.radius then
-            return manualPath
-        end
+        if dist <= zone.radius then return manualPath end
     end
     return nil
 end
@@ -604,35 +734,25 @@ walkToEgg = function(targetInstance, eggColor)
     local targetPos         = resolvePos(targetInstance)
     if not targetPos then return "done" end
 
-    -- Check if this egg is in a manual path zone
+    -- Manual zone check
     local manualPath = getManualPathForEgg(targetPos)
-
     if manualPath then
-        -- Step 1: normal pathfind to the entry point
         local path = PathfindingService:CreatePath(PATH_PARAMS)
         pcall(function() path:ComputeAsync(root.Position, manualPath.entryPoint) end)
-
         if path.Status == Enum.PathStatus.Success then
             local waypoints           = path:GetWaypoints()
             local pathFolder, cleanup = makePathFolder(waypoints, eggColor)
             local ok = true
-
             for _, wp in ipairs(waypoints) do
                 if not farmEnabled or not isAlive(targetInstance) then ok = false break end
-                local stepResult = stepToWaypoint(hum, root, wp)
-                if stepResult ~= "reached" and stepResult ~= "timeout" then
-                    ok = false break
-                end
+                local r = stepToWaypoint(hum, root, wp)
+                if r ~= "reached" and r ~= "timeout" then ok = false break end
             end
             cleanup()
             if not ok then return "fail" end
         end
-
-        -- Step 2: walk the manual waypoints
         local result = walkManualPath(manualPath.waypoints)
         if result ~= "done" then return "fail" end
-
-        -- Step 3: fire the proximity prompt if egg is still alive
         if isAlive(targetInstance) then
             for _, v in ipairs(targetInstance:GetDescendants()) do
                 if v:IsA("ProximityPrompt") then
@@ -641,20 +761,29 @@ walkToEgg = function(targetInstance, eggColor)
                 end
             end
         end
-
         lastEscapeDir[uid] = nil
         task.wait(0.1)
         return "done"
     end
 
-    -- Normal pathfinding for eggs not in any manual zone
+    -- Check if egg is inside or very close to an obstacle
+    -- If so, path to an approach position beside the obstacle first
+    local obstacle      = getOverlappingObstacle(targetPos, 3)
+    local approachPos   = nil
+    if obstacle then
+        approachPos = getApproachPosition(targetPos, obstacle)
+        if approachPos then
+            print("[EggBot] Egg near obstacle — approaching from side first")
+        end
+    end
+
     for attempt = 1, MAX_PATH_ATTEMPTS do
         if not farmEnabled then return "stopped" end
         targetPos = resolvePos(targetInstance)
         if not targetPos then return "done" end
 
         if consecutiveStucks >= STUCK_ESCAPE_THRESHOLD then
-            print("[EggBot] Hard stuck x" .. consecutiveStucks .. " — running escape maneuver")
+            print("[EggBot] Hard stuck x" .. consecutiveStucks .. " — escape maneuver")
             doEscapeManeuver(hum, root, uid)
             consecutiveStucks = 0
             char = getChar()
@@ -663,9 +792,23 @@ walkToEgg = function(targetInstance, eggColor)
             if not hum or not root then return "fail" end
         end
 
+        -- If egg is near obstacle, path to approach position first
+        if approachPos and attempt == 1 then
+            local approachPath = PathfindingService:CreatePath(PATH_PARAMS)
+            pcall(function() approachPath:ComputeAsync(root.Position, approachPos) end)
+            if approachPath.Status == Enum.PathStatus.Success then
+                local awp             = approachPath:GetWaypoints()
+                local apf, acleanup  = makePathFolder(awp, eggColor)
+                for _, wp in ipairs(awp) do
+                    if not farmEnabled then acleanup() return "stopped" end
+                    stepToWaypoint(hum, root, wp)
+                end
+                acleanup()
+            end
+        end
+
         local path = PathfindingService:CreatePath(PATH_PARAMS)
         local ok   = pcall(function() path:ComputeAsync(root.Position, targetPos) end)
-
         if not ok or path.Status ~= Enum.PathStatus.Success then
             task.wait(0.2)
             continue
@@ -682,7 +825,7 @@ walkToEgg = function(targetInstance, eggColor)
 
             local needsJump = wp.Action == Enum.PathWaypointAction.Jump
             if not needsJump and i < #waypoints then
-                if (waypoints[i + 1].Position.Y - root.Position.Y) > 0.8 then
+                if (waypoints[i+1].Position.Y - root.Position.Y) > 0.8 then
                     needsJump = true
                 end
             end
@@ -691,7 +834,7 @@ walkToEgg = function(targetInstance, eggColor)
             local stepResult = stepToWaypoint(hum, root, wp)
 
             if stepResult == "respawned" then
-                warn("[EggBot] Respawn detected on " .. uid .. " — skipping attempt")
+                warn("[EggBot] Respawn on " .. uid)
                 consecutiveStucks += 1
                 pathBroken = true
                 break
@@ -730,59 +873,60 @@ walkToEgg = function(targetInstance, eggColor)
     return "fail"
 end
 
--- ─── BLESSING OBBY RUNNER ────────────────────────────────────────────────────
-local function runBlessingObby()
-    if isRunningBlessing then return end
-    isRunningBlessing = true
-
+-- ─── GENERIC OBBY RUNNER ─────────────────────────────────────────────────────
+local function runObby(obbyData, configKey)
+    if isRunningObby then return end
+    isRunningObby = true
     local prevFarm = farmEnabled
-    farmEnabled    = false  -- pause farming while doing blessing
+    farmEnabled    = false
     isWalking      = false
-
-    print("[EggBot] Starting Basic Blessing obby")
+    print("[EggBot] Starting obby: " .. configKey)
 
     local char = getChar()
     local hum  = getHum(char)
     local root = getRoot(char)
-
     if not hum or not root then
-        isRunningBlessing = false
-        farmEnabled = prevFarm
+        isRunningObby = false
+        farmEnabled   = prevFarm
         return
     end
 
-    -- Pathfind to entry point first
     local path = PathfindingService:CreatePath(PATH_PARAMS)
-    pcall(function() path:ComputeAsync(root.Position, BLESSING_OBBY.entryPoint) end)
-
+    pcall(function() path:ComputeAsync(root.Position, obbyData.entryPoint) end)
     if path.Status == Enum.PathStatus.Success then
         local waypoints           = path:GetWaypoints()
         local pathFolder, cleanup = makePathFolder(waypoints, Color3.fromRGB(0, 200, 255))
-
-        for _, wp in ipairs(waypoints) do
-            stepToWaypoint(hum, root, wp)
-        end
+        for _, wp in ipairs(waypoints) do stepToWaypoint(hum, root, wp) end
         cleanup()
     end
 
-    -- Walk the obby
-    -- isRunningBlessing=true so walkManualPath won't stop early
-    local result = walkManualPath(BLESSING_OBBY.waypoints, 2.0)
-
+    local result = walkManualPath(obbyData.waypoints, 2.0)
     if result == "done" then
-        print("[EggBot] Basic Blessing obby complete — waiting for TP")
-        -- Game TPs player to spawn, wait for it
-        task.wait(3)
+        print("[EggBot] Obby complete: " .. configKey)
+        if obbyData.respawnAfter then
+            task.wait(1)
+            Players:RequestRespawn()
+            local waitStart = tick()
+            while tick() - waitStart < 15 do
+                task.wait(0.5)
+                local r = getRoot(getChar())
+                if r and (r.Position - SPAWN_POINT).Magnitude < 50 then break end
+            end
+        else
+            task.wait(3)
+        end
     else
-        warn("[EggBot] Basic Blessing obby failed: " .. result)
+        warn("[EggBot] Obby failed: " .. configKey .. " (" .. result .. ")")
+        if obbyData.respawnAfter then
+            Players:RequestRespawn()
+            task.wait(5)
+        end
     end
 
-    config.runtime.lastBlessingUnix = os.time()
+    config.runtime[configKey] = os.time()
     saveConfig()
-
-    isRunningBlessing = false
-    farmEnabled = prevFarm
-
+    isRunningObby = false
+    farmEnabled   = prevFarm
     if farmEnabled then
         task.wait(0.5)
         scanAllEggs()
@@ -841,32 +985,26 @@ end
 function scanAllEggs()
     pruneTrackedEggs()
     pruneQueue()
-    for _, v in ipairs(workspace:GetDescendants()) do
-        queueEgg(v)
-    end
+    for _, v in ipairs(workspace:GetDescendants()) do queueEgg(v) end
     sortQueueIfDirty()
 end
 
 local function releaseWalking() isWalking = false end
 
 function processQueue()
-    if not farmEnabled or isWalking or isRunningBlessing or #eggQueue == 0 then return end
+    if not farmEnabled or isWalking or isRunningObby or #eggQueue == 0 then return end
     isWalking = true
 
     task.spawn(function()
         local hardTimer = task.delay(WALK_HARD_TIMEOUT, function() releaseWalking() end)
-
         pruneQueue()
         sortQueueIfDirty()
 
         local data = table.remove(eggQueue, 1)
-
         if data then
             queuedIds[data.id] = nil
-
             if isAlive(data.target) and farmEnabled then
                 local result = walkToEgg(data.target, data.color)
-
                 if result == "done" or not isAlive(data.target) then
                     trackedEggs[data.id]   = nil
                     lastEscapeDir[data.id] = nil
@@ -900,7 +1038,6 @@ function processQueue()
 
         task.cancel(hardTimer)
         releaseWalking()
-
         if farmEnabled then
             task.wait(QUEUE_COOLDOWN)
             processQueue()
@@ -943,10 +1080,10 @@ end
 
 local function buildStatusText(reason)
     return string.format(
-        "**EggBot status**\nReason: %s\nPlayer: %s\nPlaceId: %s\nJobId: %s\nFarm: %s\nAutoExec: %s\nAutoRefresh: %s\nRefreshMinutes: %s\nScriptStarts: %s\nAutoExecCount: %s\nRejoinCount: %s\nSoftRefreshCount: %s",
+        "**EggBot status**\nReason: %s\nPlayer: %s\nPlaceId: %s\nJobId: %s\nFarm: %s\nAutoExec: %s\nAutoRefresh: %s\nScriptStarts: %s\nAutoExecCount: %s\nRejoinCount: %s\nSoftRefreshCount: %s",
         reason, tostring(player.Name), tostring(game.PlaceId), tostring(game.JobId),
         farmEnabled and "ON" or "OFF", autoExecEnabled and "ON" or "OFF",
-        autoRefreshEnabled and "ON" or "OFF", tostring(refreshMinutes),
+        autoRefreshEnabled and "ON" or "OFF",
         tostring(config.stats.scriptStarts), tostring(config.stats.autoExecCount),
         tostring(config.stats.rejoinCount), tostring(config.stats.softRefreshCount)
     )
@@ -971,17 +1108,17 @@ local function softRefreshMacro()
     queuedIds     = {}
     trackedEggs   = {}
     lastEscapeDir = {}
-    local activePath = workspace:FindFirstChild("ActivePath")
-    if activePath then pcall(function() activePath:Destroy() end) end
+    local ap = workspace:FindFirstChild("ActivePath")
+    if ap then pcall(function() ap:Destroy() end) end
     scanAllEggs()
     if farmEnabled then task.wait(0.2) processQueue() end
 end
 
 -- ─── RECORDER ────────────────────────────────────────────────────────────────
 local allowedKeys = {
-    [Enum.KeyCode.W] = true, [Enum.KeyCode.A] = true,
-    [Enum.KeyCode.S] = true, [Enum.KeyCode.D] = true,
-    [Enum.KeyCode.Space] = true,
+    [Enum.KeyCode.W]=true, [Enum.KeyCode.A]=true,
+    [Enum.KeyCode.S]=true, [Enum.KeyCode.D]=true,
+    [Enum.KeyCode.Space]=true,
 }
 
 local function startRecording()
@@ -1011,14 +1148,14 @@ UIS.InputBegan:Connect(function(input, gameProcessed)
     if gameProcessed or not isRecording then return end
     if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
     if not allowedKeys[input.KeyCode] then return end
-    table.insert(recordedInputs, { t = math.floor((tick() - recordStartTime) * 1000), key = input.KeyCode, state = "begin" })
+    table.insert(recordedInputs, { t=math.floor((tick()-recordStartTime)*1000), key=input.KeyCode, state="begin" })
 end)
 
 UIS.InputEnded:Connect(function(input, gameProcessed)
     if not isRecording then return end
     if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
     if not allowedKeys[input.KeyCode] then return end
-    table.insert(recordedInputs, { t = math.floor((tick() - recordStartTime) * 1000), key = input.KeyCode, state = "end" })
+    table.insert(recordedInputs, { t=math.floor((tick()-recordStartTime)*1000), key=input.KeyCode, state="end" })
 end)
 
 -- ─── UI ──────────────────────────────────────────────────────────────────────
@@ -1028,134 +1165,145 @@ screenGui.ResetOnSpawn = false
 screenGui.Parent       = playerGui
 
 local frame            = Instance.new("Frame")
-frame.Size             = UDim2.new(0, 320, 0, 730)
+frame.Size             = UDim2.new(0, 320, 0, 940)
 frame.Position         = UDim2.new(0, 20, 0, 120)
 frame.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
 frame.BorderSizePixel  = 0
 frame.Parent           = screenGui
-
 Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 10)
 
 local function makeLabel(text, yPos, height)
     height = height or 20
     local l = Instance.new("TextLabel")
-    l.Size = UDim2.new(0, 280, 0, height)
-    l.Position = UDim2.new(0, 20, 0, yPos)
+    l.Size               = UDim2.new(0, 280, 0, height)
+    l.Position           = UDim2.new(0, 20, 0, yPos)
     l.BackgroundTransparency = 1
-    l.Text = text
-    l.TextColor3 = Color3.fromRGB(255, 255, 255)
-    l.Font = Enum.Font.SourceSans
-    l.TextScaled = true
-    l.Parent = frame
+    l.Text               = text
+    l.TextColor3         = Color3.fromRGB(255,255,255)
+    l.Font               = Enum.Font.SourceSans
+    l.TextScaled         = true
+    l.Parent             = frame
     return l
 end
 
-local function makeButton(text, yPos)
+local function makeButton(text, yPos, color)
+    color = color or Color3.fromRGB(60,60,60)
     local b = Instance.new("TextButton")
-    b.Size = UDim2.new(0, 280, 0, 35)
-    b.Position = UDim2.new(0, 20, 0, yPos)
-    b.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
-    b.TextColor3 = Color3.fromRGB(255, 255, 255)
-    b.Font = Enum.Font.SourceSansBold
-    b.TextScaled = true
-    b.Text = text
-    b.Parent = frame
-    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 8)
+    b.Size               = UDim2.new(0, 280, 0, 35)
+    b.Position           = UDim2.new(0, 20, 0, yPos)
+    b.BackgroundColor3   = color
+    b.TextColor3         = Color3.fromRGB(255,255,255)
+    b.Font               = Enum.Font.SourceSansBold
+    b.TextScaled         = true
+    b.Text               = text
+    b.Parent             = frame
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0,8)
     return b
 end
 
 local function makeBox(placeholder, value, yPos)
     local b = Instance.new("TextBox")
-    b.Size = UDim2.new(0, 280, 0, 28)
-    b.Position = UDim2.new(0, 20, 0, yPos)
-    b.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
-    b.TextColor3 = Color3.fromRGB(255, 255, 255)
-    b.PlaceholderText = placeholder
-    b.Text = tostring(value)
-    b.Font = Enum.Font.SourceSans
-    b.TextScaled = true
-    b.ClearTextOnFocus = false
-    b.Parent = frame
-    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 8)
+    b.Size               = UDim2.new(0, 280, 0, 28)
+    b.Position           = UDim2.new(0, 20, 0, yPos)
+    b.BackgroundColor3   = Color3.fromRGB(50,50,50)
+    b.TextColor3         = Color3.fromRGB(255,255,255)
+    b.PlaceholderText    = placeholder
+    b.Text               = tostring(value)
+    b.Font               = Enum.Font.SourceSans
+    b.TextScaled         = true
+    b.ClearTextOnFocus   = false
+    b.Parent             = frame
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0,8)
     return b
 end
 
+local function makeSeparator(yPos)
+    local l = Instance.new("Frame")
+    l.Size             = UDim2.new(0, 280, 0, 1)
+    l.Position         = UDim2.new(0, 20, 0, yPos)
+    l.BackgroundColor3 = Color3.fromRGB(60,60,60)
+    l.BorderSizePixel  = 0
+    l.Parent           = frame
+end
+
 local title = makeLabel("Egg Macro", 0, 30)
-title.Font = Enum.Font.SourceSansBold
+title.Font  = Enum.Font.SourceSansBold
 
-local toggleButton   = makeButton(farmEnabled and "Macro: ON" or "Macro: OFF", 40)
-toggleButton.BackgroundColor3 = Color3.fromRGB(60,60,60)
-
+local toggleButton       = makeButton(farmEnabled and "Macro: ON" or "Macro: OFF", 40)
 makeLabel("Jump every X seconds:", 85)
-local jumpBox        = makeBox("Enter seconds", jumpInterval, 108)
+local jumpBox            = makeBox("Enter seconds", jumpInterval, 108)
 
-local recordButton   = Instance.new("TextButton")
-recordButton.Size    = UDim2.new(0, 135, 0, 35)
-recordButton.Position = UDim2.new(0, 20, 0, 148)
+local recordButton = Instance.new("TextButton")
+recordButton.Size        = UDim2.new(0, 135, 0, 35)
+recordButton.Position    = UDim2.new(0, 20, 0, 148)
 recordButton.BackgroundColor3 = Color3.fromRGB(70,70,70)
-recordButton.TextColor3 = Color3.fromRGB(255,255,255)
-recordButton.Font = Enum.Font.SourceSansBold
-recordButton.TextScaled = true
-recordButton.Text = "Record: OFF"
-recordButton.Parent = frame
+recordButton.TextColor3  = Color3.fromRGB(255,255,255)
+recordButton.Font        = Enum.Font.SourceSansBold
+recordButton.TextScaled  = true
+recordButton.Text        = "Record: OFF"
+recordButton.Parent      = frame
 Instance.new("UICorner", recordButton).CornerRadius = UDim.new(0,8)
 
-local testButton     = Instance.new("TextButton")
-testButton.Size      = UDim2.new(0, 135, 0, 35)
-testButton.Position  = UDim2.new(0, 165, 0, 148)
+local testButton = Instance.new("TextButton")
+testButton.Size          = UDim2.new(0, 135, 0, 35)
+testButton.Position      = UDim2.new(0, 165, 0, 148)
 testButton.BackgroundColor3 = Color3.fromRGB(70,70,70)
-testButton.TextColor3 = Color3.fromRGB(255,255,255)
-testButton.Font = Enum.Font.SourceSansBold
-testButton.TextScaled = true
-testButton.Text = "Test Recording"
-testButton.Parent = frame
+testButton.TextColor3    = Color3.fromRGB(255,255,255)
+testButton.Font          = Enum.Font.SourceSansBold
+testButton.TextScaled    = true
+testButton.Text          = "Test Recording"
+testButton.Parent        = frame
 Instance.new("UICorner", testButton).CornerRadius = UDim.new(0,8)
 
 makeLabel("Run recording every X seconds:", 194)
-local repeatBox      = makeBox("Enter seconds", repeatInterval, 217)
+local repeatBox          = makeBox("Enter seconds", repeatInterval, 217)
+local repeatToggle       = makeButton("Recorder Loop: OFF", 258, Color3.fromRGB(70,70,70))
 
-local repeatToggle   = makeButton("Recorder Loop: OFF", 258)
-local autoExecButton = makeButton(autoExecEnabled and "Auto Exec: ON" or "Auto Exec: OFF", 304)
-local autoRefreshButton = makeButton(autoRefreshEnabled and "Soft Refresh: ON" or "Soft Refresh: OFF", 350)
+makeSeparator(305)
+local autoExecButton     = makeButton(autoExecEnabled and "Auto Exec: ON" or "Auto Exec: OFF", 315, Color3.fromRGB(70,70,70))
+local autoRefreshButton  = makeButton(autoRefreshEnabled and "Soft Refresh: ON" or "Soft Refresh: OFF", 361, Color3.fromRGB(70,70,70))
+makeLabel("Soft refresh every X minutes:", 406)
+local refreshBox         = makeBox("Enter minutes", refreshMinutes, 429)
 
-makeLabel("Soft refresh every X minutes:", 395)
-local refreshBox     = makeBox("Enter minutes", refreshMinutes, 418)
+makeSeparator(470)
+makeLabel("── Basic Blessing ──", 476, 20)
+local blessingButton     = makeButton(blessingEnabled and "Basic Blessing: ON" or "Basic Blessing: OFF", 500, Color3.fromRGB(40,80,40))
+local runBlessingButton  = makeButton("Run Blessing Now", 546, Color3.fromRGB(40,65,90))
+makeLabel("Auto-run every X minutes:", 592)
+local blessingIntervalBox = makeBox("Enter minutes", blessingInterval, 615)
 
--- Blessing UI
-local blessingButton = makeButton(blessingEnabled and "Basic Blessing: ON" or "Basic Blessing: OFF", 458)
-blessingButton.BackgroundColor3 = Color3.fromRGB(50, 80, 50)
+makeSeparator(655)
+makeLabel("── Grail of Resonance ──", 661, 20)
+local grailButton        = makeButton(grailEnabled and "Grail: ON" or "Grail: OFF", 685, Color3.fromRGB(80,40,80))
+local runGrailButton     = makeButton("Run Grail Now", 731, Color3.fromRGB(65,40,90))
+makeLabel("Auto-run every X minutes:", 777)
+local grailIntervalBox   = makeBox("Enter minutes", grailInterval, 800)
 
-local runBlessingButton = makeButton("Run Blessing Now", 504)
-runBlessingButton.BackgroundColor3 = Color3.fromRGB(50, 60, 90)
-
-makeLabel("Blessing every X minutes:", 550)
-local blessingIntervalBox = makeBox("Enter minutes", blessingInterval, 573)
-
-makeLabel("Discord webhook (text only):", 607)
-local webhookBox     = makeBox("Paste webhook URL", config.webhookUrl or "", 630)
-webhookBox.TextScaled = false
+makeSeparator(840)
+makeLabel("Discord webhook:", 846)
+local webhookBox         = makeBox("Paste webhook URL", config.webhookUrl or "", 869)
+webhookBox.TextScaled    = false
 webhookBox.TextXAlignment = Enum.TextXAlignment.Left
 
 local statsLabel = Instance.new("TextLabel")
-statsLabel.Size = UDim2.new(0, 280, 0, 60)
-statsLabel.Position = UDim2.new(0, 20, 0, 665)
+statsLabel.Size              = UDim2.new(0, 280, 0, 60)
+statsLabel.Position          = UDim2.new(0, 20, 0, 875)
 statsLabel.BackgroundTransparency = 1
-statsLabel.TextColor3 = Color3.fromRGB(255,255,255)
-statsLabel.Font = Enum.Font.SourceSans
-statsLabel.TextScaled = false
-statsLabel.TextWrapped = true
-statsLabel.TextXAlignment = Enum.TextXAlignment.Left
-statsLabel.TextYAlignment = Enum.TextYAlignment.Top
-statsLabel.Parent = frame
+statsLabel.TextColor3        = Color3.fromRGB(255,255,255)
+statsLabel.Font              = Enum.Font.SourceSans
+statsLabel.TextScaled        = false
+statsLabel.TextWrapped       = true
+statsLabel.TextXAlignment    = Enum.TextXAlignment.Left
+statsLabel.TextYAlignment    = Enum.TextYAlignment.Top
+statsLabel.Parent            = frame
 
 local function updateStatsLabel()
     statsLabel.Text =
         "Starts: " .. tostring(config.stats.scriptStarts) ..
-        " | AutoExec: " .. tostring(config.stats.autoExecCount) ..
         " | Rejoins: " .. tostring(config.stats.rejoinCount) ..
-        "\nSoftRefresh: " .. tostring(config.stats.softRefreshCount) ..
-        " | Farm: " .. (farmEnabled and "ON" or "OFF") ..
-        " | Blessing: " .. (blessingEnabled and "ON" or "OFF")
+        "\nFarm: " .. (farmEnabled and "ON" or "OFF") ..
+        " | Blessing: " .. (blessingEnabled and "ON" or "OFF") ..
+        " | Grail: " .. (grailEnabled and "ON" or "OFF")
 end
 
 updateStatsLabel()
@@ -1204,6 +1352,13 @@ blessingIntervalBox.FocusLost:Connect(function()
     syncConfig()
 end)
 
+grailIntervalBox.FocusLost:Connect(function()
+    local num = tonumber(grailIntervalBox.Text)
+    if num and num > 0 then grailInterval = math.max(1, math.floor(num)) end
+    grailIntervalBox.Text = tostring(grailInterval)
+    syncConfig()
+end)
+
 webhookBox.FocusLost:Connect(function()
     config.webhookUrl = webhookBox.Text or ""
     saveConfig()
@@ -1249,8 +1404,21 @@ blessingButton.MouseButton1Click:Connect(function()
 end)
 
 runBlessingButton.MouseButton1Click:Connect(function()
-    if not isRunningBlessing then
-        task.spawn(runBlessingObby)
+    if not isRunningObby then
+        task.spawn(function() runObby(BLESSING_OBBY, "lastBlessingUnix") end)
+    end
+end)
+
+grailButton.MouseButton1Click:Connect(function()
+    grailEnabled = not grailEnabled
+    syncConfig()
+    grailButton.Text = grailEnabled and "Grail: ON" or "Grail: OFF"
+    updateStatsLabel()
+end)
+
+runGrailButton.MouseButton1Click:Connect(function()
+    if not isRunningObby then
+        task.spawn(function() runObby(GRAIL_OBBY, "lastGrailUnix") end)
     end
 end)
 
@@ -1271,7 +1439,7 @@ end)
 UIS.InputChanged:Connect(function(input)
     if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then
         local delta = input.Position - dragStart
-        frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+        frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset+delta.X, startPos.Y.Scale, startPos.Y.Offset+delta.Y)
     end
 end)
 
@@ -1308,10 +1476,10 @@ end)
 task.spawn(function()
     while true do
         task.wait(1)
-        -- Auto soft refresh
+
         if autoRefreshEnabled then
             local refreshSeconds = math.max(60, refreshMinutes * 60)
-            local elapsed = os.time() - (config.runtime.lastStartUnix or os.time())
+            local elapsed        = os.time() - (config.runtime.lastStartUnix or os.time())
             if elapsed >= refreshSeconds then
                 config.stats.softRefreshCount  += 1
                 config.runtime.lastStartUnix    = os.time()
@@ -1321,13 +1489,20 @@ task.spawn(function()
                 sendWebhookMessage(buildStatusText("Scheduled soft refresh"))
             end
         end
-        -- Auto blessing
-        if blessingEnabled and not isRunningBlessing then
-            local blessingSeconds = math.max(60, blessingInterval * 60)
-            local lastBlessing    = config.runtime.lastBlessingUnix or 0
-            local elapsed         = os.time() - lastBlessing
-            if elapsed >= blessingSeconds then
-                task.spawn(runBlessingObby)
+
+        if blessingEnabled and not isRunningObby then
+            local seconds = math.max(60, blessingInterval * 60)
+            local lastRun = config.runtime.lastBlessingUnix or 0
+            if os.time() - lastRun >= seconds then
+                task.spawn(function() runObby(BLESSING_OBBY, "lastBlessingUnix") end)
+            end
+        end
+
+        if grailEnabled and not isRunningObby then
+            local seconds = math.max(60, grailInterval * 60)
+            local lastRun = config.runtime.lastGrailUnix or 0
+            if os.time() - lastRun >= seconds then
+                task.spawn(function() runObby(GRAIL_OBBY, "lastGrailUnix") end)
             end
         end
     end
