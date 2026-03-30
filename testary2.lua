@@ -29,7 +29,7 @@ local RESCAN_INTERVAL        = 5
 local STUCK_ESCAPE_THRESHOLD = 1
 local DETOUR_MAX_DISTANCE    = 20
 local DETOUR_PATH_OVERHEAD   = 1.25
-local FAIL_BEFORE_SKIP       = 4
+local FAIL_BEFORE_SKIP       = 7
 local JUMP_ZONE_RADIUS       = 8
 
 -- ─── INVISIBLE OBSTACLES ─────────────────────────────────────────────────────
